@@ -1,6 +1,6 @@
 # PLAN
 
-Updated: 2026-08-12 · Active: S2
+Updated: 2026-08-12 · Active: S3
 
 A document closes when it answers its own question without reference to
 the conversation it came from, and when every cross-reference in it
@@ -29,7 +29,7 @@ order and the step the work continues from.
         and tracking origin. The reactor is being split out; where the
         split lands (crate or repository) is not yet settled.
 
-## S2 — Foundations  [in progress]
+## S2 — Foundations  [done]
 
 Goal: the execution unit is specified before anything is built on it.
 Done when: S3 and S4 can be written without reopening any question in S2.
@@ -133,7 +133,7 @@ Done when: S3 and S4 can be written without reopening any question in S2.
         unspecified, and one order corrupts. Accepted in full; document
         rewritten.
 
-## S3 — Objects and I/O  [ ]
+## S3 — Objects and I/O  [in progress]
 
 Goal: an operation can be described end to end, from submission to the
 release of its buffer.
