@@ -213,3 +213,26 @@ no free list, and a policy for a completion that never arrives.
 Cost: a consumer cannot read into a local variable. The buffer contracts
 (`design/reactor.md`) are the API that replaces it, and one of the three
 already hands the buffer out from a pool rather than taking one.
+
+## 2026-08-12 — The wait-for relation is the wait records, traversed on demand
+
+Deadlock detection follows `poster` links from one parked unit's wait
+record to the next. There is no separate graph structure and no scan of
+the population: the records already hold both halves of every edge, so a
+maintained graph would be a copy that can disagree with the truth, and a
+scan would cost the number of units rather than the size of the question.
+This settles the mechanism left open on 2026-08-12.
+
+The two wait modes make one algorithm cover both cases the literature
+separates. Assume every parked unit reachable from the suspect is
+blocked, then remove any unit that is not — an OR unit with any live
+half, an AND unit with every half live — and repeat to a fixed point.
+Under AND alone that finds a cycle; under OR alone it finds a knot; the
+modes are in the records, so nothing has to choose between the two
+algorithms.
+
+Rejected: quiescence as the criterion, which is what `php-src/ext/async`
+uses and which cannot see a cycle inside a busy process.
+
+Cost: a full pool scan still exists, but only for the human-facing
+diagnostic dump, and it is not on the detector's path.

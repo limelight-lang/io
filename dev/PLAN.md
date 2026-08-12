@@ -167,7 +167,7 @@ boundary with the collector is stated.
         scan over the pools, and states both wait models, the validation
         of a result against a moving system, what is shared with the
         collector and what is not, and the victim policy
-      tier: T2 · role: —
+      tier: T2 · role: Critic
 - [ ] S4.2 `README.md`
       done: a reader who has read only the README knows what the project
         is and in what order to read the design documents
