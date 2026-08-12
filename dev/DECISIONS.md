@@ -448,3 +448,12 @@ Open:
   the mode, which halves have fired. Whether the collector's walk yields
   those for free through the `walk` hook, or the detector needs a second
   reading pass, is not worked out.
+- **Whose thread the collector runs on**, which decides what the detector
+  can see. On its own thread, watching the mutator threads, it reads
+  every thread's entities and a cross-thread cycle is visible in one
+  pass. On a mutator's thread it sees that thread's memory only, and a
+  cycle spanning threads has to be assembled from several passes, which
+  brings back the combining step and its stall on a thread that does not
+  answer. `ll-model` has a threaded driver today (`run_epoch`) and a
+  steppable collector beside it, so both remain open. Raised by Edmond
+  2026-08-12 and explicitly left to think about.
