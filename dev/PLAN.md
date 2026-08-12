@@ -1,262 +1,29 @@
 # PLAN
 
-Updated: 2026-08-12 · Active: none — every stage closed
+Updated: 2026-08-12 · Active: none
 
 A document closes when it answers its own question without reference to
 the conversation it came from, and when every cross-reference in it
 resolves.
 
-## S1 — Repository skeleton  [done]
+Stages S1 to S4 are finished and removed (rule 23.1.3). What survived
+them: the decisions in [DECISIONS.md](DECISIONS.md), the lesson in
+[POSTMORTEM.md](POSTMORTEM.md), and the seven design documents themselves.
+The numbers S1 to S4 are not reissued.
 
-Goal: a fresh session can start from the repository instead of from the
-conversation.
-Done when: a session that has read only `dev/INDEX.md` names the reading
-order and the step the work continues from.
+## What is not yet planned
 
-- [x] S1.1 Local repository and the `dev/` journals
-      done: INDEX, WORKFLOW, ARCHITECTURE, DECISIONS, POSTMORTEM and PLAN
-        exist, and DECISIONS carries the decisions already taken
-      tier: T2 · role: —
-      handoff: repo at /home/edmond/limelight/io, branch main, one
-        commit, no remote yet. WORKFLOW is a draft copied from
-        limelight-lang/rfc and still needs Edmond's confirmation.
-        Deadlock detection is deliberately not a decision: its mechanism
-        is open and belongs to S4.1.
-- [x] S1.2 Public `limelight-lang/io` and the first push
-      done: `git ls-remote origin` returns refs
-      tier: T1 · role: —
-      handoff: https://github.com/limelight-lang/io, public, main pushed
-        and tracking origin. The reactor is being split out; where the
-        split lands (crate or repository) is not yet settled.
+The design corpus is complete and no code exists. A stage for the first
+code needs a decision from Edmond, because the order is not derivable from
+the documents: a vertical slice that reads a socket end to end, or the
+substrate bottom-up starting at the pools and the switch. The two differ
+in what they prove and in what they leave stubbed for months.
 
-## S2 — Foundations  [done]
+Open items carried by the documents rather than by this plan:
 
-Goal: the execution unit is specified before anything is built on it.
-Done when: S3 and S4 can be written without reopening any question in S2.
-
-- [x] S2.1 `design/execution.md`
-      done: the document states what a unit is, how the two coroutine
-        kinds share one handle, and what happens at mount and unmount,
-        including the TLS rule across a suspension point
-      tier: T2 · role: Critic
-      Critic 2026-08-12 round 1, on the section outline: twelve findings,
-        six of them high. The outline funnelled nothing — a stackful park
-        (a switch that never returns) and a stackless park (a record write
-        and `Pending` up the poll chain) reached the park primitive by
-        different paths, leaving the detector a hole it cannot report. It
-        blessed "parked" as a safepoint, though an I/O park suspends
-        mid-message while the actor contract rests on an empty stack
-        between messages. It gave wake no section, so the race between a
-        completion on another thread and an unfinished suspension had
-        nowhere to be resolved. It shaped the wait record for one wait,
-        though await-with-timeout is an OR of two. It stated a TLS rule
-        that foreign frames break by construction (errno, openssl's error
-        queue). And it left the poll ABI the Limelight compiler owes the
-        substrate unnamed, which `pool.md` would have had to invent.
-        Accepted in full; outline rewritten from ten sections to thirteen.
-      Critic 2026-08-12 round 2, on the written text: eighteen findings,
-        five high, and the parking protocol was wrong as written. A waker
-        finding `Running` had no legal move, so a reply that arrived
-        before the suspension was lost; the fix orders the protocol —
-        state first, record second, arm third — which makes `Running`
-        unreachable for a waker. `Parked` was published by the unit, which
-        announces a context still being saved; the worker publishes it
-        now, after the switch. AND waits could not terminate, because no
-        waker was allowed to write the record; wakers now decrement a
-        counter. A retired loser of an OR wait could wake the unit out of
-        an unrelated wait; every waker validates the epoch first. Results
-        had no channel at all. Accepted in full; the protocol sections
-        were rewritten and "Waking" added as a section of its own.
-      handoff: design/execution.md, 15 sections. The parking protocol is
-        the load-bearing part: four states, every transition a CAS, the
-        order state→record→arm, and `Parked` published by the worker.
-        Exactly one enqueue per wake, decided by that CAS. Open and owed
-        to another repo: mark termination waits on the slowest parked
-        operation, which belongs in rfc/BACKLOG.md and is not there.
-- [x] S2.2 `design/switching.md`
-      done: the document states which registers a switch saves in each
-        of the two cases, how the live-register mask reaches the switch,
-        and how the foreign-frame bit is set and cleared
-      tier: T2 · role: Critic
-      Critic 2026-08-12 round 1: the narrow switch was unsound as
-        designed. A per-site live-register mask cannot see the frames
-        above it, so a callee-saved register holding an ancestor's value
-        goes unsaved and another unit overwrites it — silent corruption,
-        no crash. Correcting the mask to "live, plus every callee-saved
-        register this frame did not spill" restores nearly the full set
-        and erases the gain, so the mask was dropped: narrowing is now a
-        calling convention with no callee-saved registers along
-        suspendable paths, and the park primitive's tail is assembly
-        because a rustc-compiled frame between the site and the switch
-        would carry live values of its own. Four more findings held. The
-        foreign-frame marker is a counter, not a bit: foreign code calls
-        back into ours, and the inner return would clear a marker the
-        outer frame still needs, which also mis-answers migration and
-        force-killability. corosensei carries no CET sequence — verified
-        in its x86_64 source — so "the library provides the full switch"
-        was false on any host with user shadow stacks. The TEB swap
-        omitted GuaranteedStackBytes, and "read the offset from the
-        running TEB" was incoherent. The QEMU assembly-coroutine citation
-        was wrong: that backend was never merged. Accepted in full;
-        document rewritten.
-      handoff: design/switching.md, 200 lines. The load-bearing reversal
-        is that narrowing is a calling convention, not a mask, and the
-        park primitive's tail must be assembly for it to apply. The
-        foreign-frame marker is a counter with three readers — the
-        switch, migration, force-killability — so a unit that opts out of
-        maintaining it reads as permanently non-zero. CET is ours to
-        write: corosensei has no shadow-stack support.
-- [x] S2.3 `design/stacks.md`
-      done: the document states the reservation and commit scheme per
-        platform, the size classes, the pooling and release protocol, and
-        the mapping ceiling with the measured figures
-      tier: T2 · role: Critic
-      Critic 2026-08-12 round 1: twenty-two findings, seven high, and one
-        of them removed half the document. The release gate — "a stack
-        returns only after the kernel holds no reference into it" — was
-        unevaluable, because the wait record is overwritten on every park
-        and nothing survived a unit to remember an operation still in
-        flight; worse, the gate protected pool reuse but not the same
-        running unit laying new frames over a retired read's buffer. The
-        answer was to remove the case: nothing the kernel touches lives
-        on a stack, so a stack's lifetime is exactly its unit's. Six more
-        held. Overflow-by-unwinding is not implementable as promised —
-        ARM EHABI has no instruction-precise unwinding, Rust's panic path
-        is not async-signal-safe, and Windows uses SEH — so the default
-        is now process death with a per-platform opt-in. `MEM_RESET` on
-        Windows releases nothing: the commit charge stays, which is a
-        leak on the platform where the table claimed release.
-        `MAP_NORESERVE` is ignored under `vm.overcommit_memory=2`.
-        GCC assumes a 64 KB guard on AArch64, so a one-page band is
-        stepped over by probed code. Every figure was a 4 KB-page figure
-        on targets that run 16 KB pages. Release ordering was
-        unspecified, and one order corrupts. Accepted in full; document
-        rewritten.
-
-## S3 — Objects and I/O  [done]
-
-Goal: an operation can be described end to end, from submission to the
-release of its buffer.
-Done when: the three buffer contracts are stated with their ownership
-rules and their behaviour on each of the four backends.
-
-- [x] S3.1 `design/pool.md`
-      done: the document states the object layout for coroutines, sockets
-        and timers, the fields the wait edge occupies, and how a pool is
-        walked while the system runs
-      tier: T2 · role: Critic
-      Critic 2026-08-12 round 1: thirteen findings, five high, and two of
-        them broke the wake path. Validating a handle and then writing is
-        check-then-act: a slot released between the two takes the writes,
-        so a late waker stored a result into a stranger's record and woke
-        it out of a wait nothing satisfied. Reclamation is now deferred —
-        a released slot is not handed out until every worker has passed a
-        quiescent point — and the generation covers only the after-reuse
-        case. The handle contradicted execution.md outright: a pointer
-        with flags there, slab plus generation here, and `wake` carried no
-        generation at all, so "a wake validates both" was unimplementable.
-        The handle is now a 64-bit word with the generation in it, and
-        both documents say so. The walker re-read the epoch but not the
-        state word, and a unit's epoch changes only at its next park, so a
-        woken-and-running unit still validated as parked and closed a
-        phantom cycle. The record is now a seqlock with the epoch as its
-        sequence. An operation slot was released on "its completion",
-        which is wrong for zero-copy send (two), multishot (many) and a
-        cancelled operation (its own plus the cancel's). And the step's
-        own criterion was unmet: only the unit slot was laid out. Accepted
-        in full; document rewritten, execution.md patched in four places.
-- [x] S3.2 `design/reactor.md`
-      done: the document states the completion-first API, the three
-        buffer contracts, how each degrades on IOCP, kqueue and epoll,
-        and where zero-copy applies
-      tier: T2 · role: Critic
-      Critic 2026-08-12 round 1: twenty-one findings, six high, most of
-        them kernel facts rather than design. A zero-copy send posts its
-        notification only when the first completion carries
-        `IORING_CQE_F_MORE`, so the unconditional two-completion rule
-        stranded a buffer on every failed send — corrected here and in
-        DECISIONS. Multishot completions were being validated against a
-        unit's epoch, which is stale after the unit's first re-park, so
-        every chunk after the first would have been discarded; they target
-        the socket now. Parking on the socket's queue lost wakeups for
-        want of an arm-time recheck. The series ends routinely on
-        `-ENOBUFS` and on completion-ring overflow — at peak load, not at
-        idle — and nobody owned resubmission. Submission-queue ownership
-        was unstated, and the shared-ring reading hangs: without a polling
-        thread, entries written by another worker while the owner sleeps
-        are never submitted, so there is one ring per worker. Buffer
-        ownership after a retired half was stated twice and
-        contradictorily; the buffer belongs to the operation, never to the
-        caller. Below those: `splice` needs a pipe so the io_uring path is
-        the expensive one, IOCP reaches contract 3 through a zero-length
-        receive, readiness backends must synthesize a completion for a
-        cancel or leak a buffer per timed-out read, and io_uring's
-        features span 5.19 to 6.15 and need per-feature degradation.
-        Accepted in full; document rewritten.
-- [x] S3.3 `design/cancellation.md`
-      done: the document states the two-phase teardown and the condition
-        under which a stack and a buffer return to their pools
-      tier: T2 · role: Critic
-      Critic 2026-08-12 round 1: seventeen findings, six high. A cancelled
-        unit parked on an AND wait never resumed: the cancel went through
-        the ordinary wake, which decrements `remaining` and returns
-        without waking until it reaches zero, and the retired halves were
-        never going to complete. A cancel racing a park was lost for good,
-        because it validated an epoch the unit was in the middle of
-        replacing, and idempotence then made every retry a no-op. Both are
-        fixed by delivering a cancel through the state word: one CAS sets
-        a cancelled bit, the winner bumps the epoch and retires the halves
-        once, and the existing `Parking → Parked` swap is where the bit is
-        checked. "Nothing to cancel on the readiness backends" was false
-        for a syscall already in flight, for file I/O on the thread pool
-        and for `connect`. Zero-copy send released the buffer on the
-        result instead of the notification. A kernel cancel could match a
-        reused operation slot. And the request returned nothing, so the
-        deadlock victim policy could not learn that its victim was
-        unkillable. Accepted in full; document rewritten, and
-        execution.md's forced teardown removed — a unit always unwinds
-        itself.
-
-## S4 — Reliability  [done]
-
-Goal: a wait cycle is found while the process is busy, and reported as
-data.
-Done when: the detector is specified for both AND and OR waits, and its
-boundary with the collector is stated.
-
-- [x] S4.1 `design/deadlock.md`
-      done: the document picks between a maintained wait-for graph and a
-        scan over the pools, and states both wait models, the validation
-        of a result against a moving system, what is shared with the
-        collector and what is not, and the victim policy
-      tier: T2 · role: Critic
-      Critic 2026-08-12 round 1: fourteen findings, five high, and the
-        first invents a deadlock in a system where nothing is racing. The
-        search read posters and ignored the decision fields, so a unit in
-        an AND wait whose first half had already fired — and which was
-        therefore waiting only on the kernel — was marked blocked because
-        the fired half still pointed back into the set. It now reads the
-        winner, `remaining` and the fired flags and considers only
-        outstanding halves. The trigger had no mechanism at all: a parked
-        unit has no worker and no timer, and PostgreSQL's waiter is an OS
-        process that can arm one for itself. A watchdog goes into the
-        reactor's timer wheel at park time, and only for a wait with no
-        kernel half — which is what keeps a hundred thousand idle
-        connections at zero cost. The poster field went stale on ownership
-        transfer, so edges now run unit → resource → unit and the owner is
-        read fresh; that also gives the actor edge somewhere to land. Two
-        concurrent searches could confirm overlapping sets and kill two
-        victims, so a search claims its set with one CAS — the detector's
-        only write. The victim was chosen from the reachable set rather
-        than from the cycle core, which kills bystanders while the cycle
-        survives. Accepted in full; document rewritten, pool.md and
-        execution.md aligned to the resource-owner indirection.
-- [x] S4.2 `README.md`
-      done: a reader who has read only the README knows what the project
-        is and in what order to read the design documents
-      tier: T1 · role: —
-      handoff: README.md states the eight pillars, the two rules that
-        carry the rest, the reading order and the crate graph. The two
-        rules are the ones worth defending in review: nothing
-        kernel-visible on a stack, and one park primitive that records
-        both halves of a wait.
+- each document's own "Open questions" section;
+- `dev/BENCHMARKS.md` does not exist, and `design/switching.md` and
+  `design/stacks.md` both name measurements that must be taken before
+  their claims can be made;
+- `rfc/BACKLOG.md` carries one defect raised here and owned there: mark
+  termination waits on the slowest parked actor.
