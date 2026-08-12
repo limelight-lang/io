@@ -170,10 +170,29 @@ rules and their behaviour on each of the four backends.
         buffer contracts, how each degrades on IOCP, kqueue and epoll,
         and where zero-copy applies
       tier: T2 · role: Critic
-- [ ] S3.3 `design/cancellation.md`
+- [x] S3.3 `design/cancellation.md`
       done: the document states the two-phase teardown and the condition
         under which a stack and a buffer return to their pools
       tier: T2 · role: Critic
+      Critic 2026-08-12 round 1: seventeen findings, six high. A cancelled
+        unit parked on an AND wait never resumed: the cancel went through
+        the ordinary wake, which decrements `remaining` and returns
+        without waking until it reaches zero, and the retired halves were
+        never going to complete. A cancel racing a park was lost for good,
+        because it validated an epoch the unit was in the middle of
+        replacing, and idempotence then made every retry a no-op. Both are
+        fixed by delivering a cancel through the state word: one CAS sets
+        a cancelled bit, the winner bumps the epoch and retires the halves
+        once, and the existing `Parking → Parked` swap is where the bit is
+        checked. "Nothing to cancel on the readiness backends" was false
+        for a syscall already in flight, for file I/O on the thread pool
+        and for `connect`. Zero-copy send released the buffer on the
+        result instead of the notification. A kernel cancel could match a
+        reused operation slot. And the request returned nothing, so the
+        deadlock victim policy could not learn that its victim was
+        unkillable. Accepted in full; document rewritten, and
+        execution.md's forced teardown removed — a unit always unwinds
+        itself.
 
 ## S4 — Reliability  [ ]
 

@@ -139,11 +139,17 @@ completion arrive with nowhere to record itself.
    would announce a context that is still being saved, and a waker acting
    on that announcement would mount a half-saved unit on a second thread.
 
-If the worker's compare-and-swap fails, the state is `Woken`: a wake
-arrived during the suspension. The worker then enqueues the handle
-itself. A stackful unit is already suspended and resumes normally. A
-stackless unit is re-polled, which is correct because its frames unwound
-when `poll` returned and its state machine holds everything it needs.
+If the worker's compare-and-swap fails, a wake arrived during the
+suspension — the state is `Woken`, or the cancelled bit is set, and the
+two are handled alike. The worker then enqueues the handle itself. A
+stackful unit is already suspended and resumes normally. A stackless unit
+is re-polled, which is correct because its frames unwound when `poll`
+returned and its state machine holds everything it needs.
+
+This swap is also the one place the cancelled bit is checked, so a unit
+that begins parking after a cancel was requested does not sleep
+(`design/cancellation.md`). No separate check and no separate ordering is
+introduced for it.
 
 Nothing else in the system may register a wait. A wait recorded outside
 this primitive is invisible to the deadlock detector, and its absence is
@@ -428,27 +434,32 @@ the buffer pool (`design/stacks.md`, `design/reactor.md`). Without that
 rule a late completion would write into a stack already handed to another
 unit, and a stack would have to outlive its owner.
 
-### Cancellation leaves `Parked` the way a wake does
+### Cancellation moves the state word, not a half
 
-Cancelling a parked unit is a wake carrying a cancelled result, delivered
-through the same `wake` call with the same epoch check. No state and no
-path is added for it: the unit resumes, observes the cancelled result, and
-unwinds from its own suspension point. This is what keeps the state
-machine four states wide.
+Cancelling a parked unit sets a cancelled bit in the state word with the
+same compare-and-swap the parking protocol uses, and the winner bumps the
+epoch so every armed half goes stale
+(`design/cancellation.md`). It does not go through `wake`'s half index and
+counter, because an AND wait's counter would swallow it: a waker that does
+not take `remaining` to zero returns without waking, and a cancelled unit
+would sleep forever waiting for halves that were just retired.
 
-### Cooperative completion and forced teardown
+The state machine stays four states wide. The bit is a modifier on the
+transitions that already exist, not a fifth state.
 
-A unit normally ends by finishing its body. Forced teardown — ending a
-unit that has not agreed to end — is available only where the frames can
-be unwound: unwinding through a foreign frame is undefined unless that
-frame was compiled to allow it, and the cleanup it would skip is
-arbitrary.
+### A unit always ends itself
 
-A unit with a live foreign frame is therefore not force-killable, only
-cancellable at its next suspension point. A unit parked below a foreign
-frame that never returns cannot be ended at all. Any policy that picks a
-victim — a deadlock victim above all — inherits this limit and must state
-what it does when the victim it wants is unkillable.
+There is no forced teardown. Ending a unit means making its current wait
+finish with a cancelled result and letting it unwind from its own
+suspension point; no thread unwinds another thread's frames, because the
+frames below a suspension point may be foreign and their cleanup is not
+ours to run.
+
+The consequence for any policy that picks a victim — a deadlock victim
+above all — is that a unit parked below a foreign frame that never returns
+cannot be ended at all. The cancel request reports that outcome rather
+than failing silently, which is what lets such a policy pick another
+victim instead of repeating itself (`design/cancellation.md`).
 
 ## Decided elsewhere
 

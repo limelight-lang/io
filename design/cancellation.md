@@ -2,185 +2,239 @@
 
 ## What cancellation is
 
-Cancellation ends a wait early. It does not kill a unit, and it does not
-take memory away from the kernel. Those are the two mistakes the design
-is arranged against, and everything below follows from keeping them
-apart.
+Cancellation ends a wait early. It does not kill a unit and it does not
+take memory away from the kernel. Those two mistakes are what the design
+is arranged against.
 
-Three things can be asked to end, and they are different operations:
+**A unit always unwinds itself.** A cancel makes its current wait finish
+with a cancelled result; the unit resumes, observes it, and unwinds from
+its own suspension point. Nothing unwinds a unit from another thread,
+because the frames below the suspension point may be foreign and their
+cleanup is not ours to run (`design/execution.md`).
 
-| Asked to end | Mechanism | Who may ask |
+## Cancelling a unit is a wake
+
+A cancel is delivered through the state word, not through a half. This is
+the whole of the fix for two failures the first version of this document
+had: a cancelled unit parked on an AND wait never resumed, because the
+ordinary wake path decrements `remaining` and returns without waking
+until it reaches zero; and a cancel racing with a park was lost, because
+it validated an epoch the unit was in the middle of replacing.
+
+**The state word carries a cancelled bit**, and the canceller sets it with
+a compare-and-swap on the same word the parking protocol already uses
+(`design/execution.md`):
+
+| State found | Transition | Effect |
 |---|---|---|
-| one half of a wait | retire it through its cancel handle | the winner of an OR wait, or a cancel request |
-| a unit's current wait | retire every half, then wake with a cancelled result | the consumer, a supervisor, the deadlock victim policy |
-| a unit's life | it ends itself after observing the cancelled result | nobody directly |
+| `Running` | set the bit | the unit's next park attempt fails and it resumes cancelled |
+| `Parking` | `Parking → Woken`, bit set | the worker's failed swap enqueues, as for any wake |
+| `Parked` | `Parked → Woken`, bit set | the canceller enqueues |
+| `Woken` | set the bit | the unit is already owed a slot; it resumes cancelled |
+| free, or generation changed | none | the unit is gone; the request reports so |
 
-**Nothing ends a unit from outside.** A cancelled unit resumes, sees a
-cancelled result, and unwinds from its own suspension point. That is what
-keeps the state machine four states wide (`design/execution.md`) and what
-makes cancellation safe in the presence of foreign frames, which cannot
-be unwound by anyone else.
+The transition is one atomic operation on one word, so there is no window
+between validating the occupant and marking it, and no epoch to race
+against.
+
+**Whoever wins the transition bumps the epoch and retires the halves.**
+Bumping the epoch is what makes every armed half stale, so no other waker
+can also claim the wait: the cancel is the winner regardless of mode, and
+an AND wait's counter is never consulted. Retirement happens once,
+performed by the winner, so cancel handles are called exactly once and
+need not be idempotent.
+
+**The parking protocol checks the bit at one place**: the worker's
+`Parking → Parked` swap, which fails if the bit is set exactly as it fails
+on `Woken`. A unit that begins parking after the bit was set therefore
+does not sleep, and the check needs no new ordering because it is the
+swap that was already there.
+
+### What the requester learns
+
+A cancel request returns one of four answers, and the deadlock victim
+policy needs all four (`design/deadlock.md`):
+
+| Answer | Meaning |
+|---|---|
+| delivered | the unit will resume cancelled |
+| already finished | the generation had changed |
+| pinned | the unit is below a live foreign frame; the bit is set, and it takes effect only if the frame returns |
+| not deliverable | the unit is parked below a foreign frame that cannot return; nothing more will happen |
+
+Without these the detector cancels a victim, learns nothing, re-detects
+the same set, and picks the same victim forever.
+
+### Two levels, and what the bit means afterwards
+
+**Cooperative** cancellation clears the bit when the cancelled result is
+delivered. The unit may park again while unwinding, which it must: closing
+a TLS session, releasing a remote lock, and flushing a log are all I/O
+that happens during cleanup.
+
+**Final** cancellation leaves the bit set. Every subsequent park fails
+immediately with a cancelled result, so unwinding cannot block, and a
+consumer that catches and discards the first cancellation cannot continue.
+Shutdown and an unresponsive victim use this level; ordinary cancellation
+does not.
+
+A consumer that swallows a cooperative cancellation has un-cancelled its
+unit, which is deliberate — a `catch` block in PHP that handles the
+cancellation exception is entitled to continue. A supervisor that means
+otherwise escalates to final.
 
 ## Retiring a half
 
-Every entry in a wait record carries an opaque cancel handle, installed
-by whoever armed that half (`design/execution.md`). Retiring is calling
-it. What it does depends on what armed the half:
+Every entry in a wait record carries an opaque cancel handle, installed by
+whoever armed that half. Retiring is calling it, and what it does depends
+on what armed it:
 
-- **A timer** is removed from the timer wheel. Synchronous, and the
-  handle is done when it returns.
+- **A timer** is removed from the wheel. Synchronous.
 - **A message to another actor** is marked so the reply is discarded on
   arrival. There is nothing to recall.
-- **A kernel operation** is a different animal, and the rest of this
-  document is about it.
+- **A kernel operation** is two phases, below.
 
-### Retirement is asynchronous, and that is the invariant
-
-A retired half may still fire. The winner of an `await` with a timeout
-resumes while the losing read is still in the kernel, and no ordering
-between them is available. The epoch check in `wake` is what makes this
-harmless: the record's epoch moved when the unit parked again, so the
-late completion validates and returns (`design/execution.md`).
-
-Every part of the design that could have depended on "retired means
-finished" instead depends on the epoch. That includes stack release,
-which does not wait for anything, because nothing the kernel touches
-lives on a stack (`dev/DECISIONS.md`, 2026-08-12).
+**Retirement is asynchronous and a retired half may still fire.** What
+makes that harmless is the epoch bump performed by whoever ended the wait:
+a late completion validates against the record's current epoch, finds it
+moved, and returns (`design/execution.md`). The epoch moves at the moment
+the wait ends, not at the unit's next park, which is why the bump belongs
+to the winner rather than to the next parking.
 
 ## Cancelling a kernel operation is two phases
 
-A submitted operation owns its buffer until its completion arrives.
-Cancelling asks the kernel to finish it sooner; it does not withdraw the
+A submitted operation owns its buffer until the kernel says it is done.
+Cancelling asks the kernel to finish sooner; it does not withdraw the
 submission and it does not return the buffer.
 
-1. **Request.** Submit a cancel naming the operation. On io_uring this is
-   `IORING_OP_ASYNC_CANCEL`, or `IORING_REGISTER_SYNC_CANCEL` where an
-   inline answer is wanted. On Windows it is `CancelIoEx`. On the
-   readiness backends there is nothing to cancel: the syscall was never
-   issued, so the descriptor is simply deregistered and the buffer is
-   free immediately.
-2. **Wait for the original completion.** It arrives whether the cancel
-   succeeded, raced and lost, or found nothing. It may report the
-   operation's real result, because a cancel that arrives after the data
-   did cancels nothing.
-3. **Release on the original completion, never on the cancel's.** The
-   operation slot is released there, and the buffer with it
-   (`design/pool.md`).
+1. **Request.** Submit a cancel naming the operation by its handle. On
+   io_uring the target is matched by `user_data`, which carries the
+   operation's handle including its generation, so a cancel cannot match
+   an operation that took the same slot later. On Windows `CancelIoEx`
+   matches an `OVERLAPPED` address, which is the operation slot's own, and
+   the slot is therefore held until the cancel completes as well as until
+   the original does. `CancelIoEx` cancels regardless of which thread
+   issued the operation, which is what the design needs: the canceller is
+   on another thread by construction.
+2. **Wait for what the kernel still owes.** The operation slot counts
+   owed completions (`design/pool.md`), and cancelling adds the cancel's
+   own. The original arrives whether the cancel succeeded, raced and lost,
+   or found nothing, and it may carry the real result, because a cancel
+   arriving after the data cancels nothing.
+3. **Release when the owed count reaches zero**, and not before. For a
+   zero-copy send that is the notification and not the result: the result
+   says the send happened, the notification says the buffer may be reused
+   (`design/reactor.md`). Releasing on the result hands a buffer back
+   while the network card may still be reading it, and the next occupant's
+   bytes go out on the wire.
 
-The cancel itself completes separately and carries only whether it found
-its target. That completion releases the cancel's own slot and nothing
-else.
+For a buffer the kernel provided from a ring, release means returning it
+to the ring rather than to the pool, and a completion flagged as retaining
+the buffer does not release anything at all.
 
-**The failure this ordering prevents:** releasing the buffer when the
-cancel completes hands pool memory back while the kernel may still be
-writing into it. The next taker of that buffer gets bytes from a socket
-it never read.
+### Submitting a cancel from the wrong thread
 
-## Cancelling a unit
+Only the worker that owns a submission queue may write to it
+(`design/reactor.md`), and retirement runs on whichever thread ended the
+wait. A cancel from another thread is posted to the owning worker's intake
+queue and submitted on its next turn, so the latency between retiring a
+half and the kernel seeing the cancel is bounded by one scheduler turn of
+that worker rather than by nothing.
 
-A cancel request against a unit does three things in order:
+`IORING_REGISTER_SYNC_CANCEL` answers inline and therefore blocks the
+thread that issues it. It is used at shutdown, on a thread that has
+nothing else to do, and nowhere else.
 
-1. **Mark the unit cancelled** in its slot, so a unit that is about to
-   park sees the mark and does not.
-2. **Retire every half** of its current wait, if it is parked.
-3. **Wake it with a cancelled result**, through the same `wake` call as
-   any completion, with the same epoch validation.
+### Inline outcomes
 
-The unit resumes, observes the result, and unwinds. Where it cannot
-unwind — a live foreign frame — it is not cancelled at all: the mark
-stays set, and the unit is cancelled at its next suspension point above
-the foreign frame, if it reaches one. A unit parked below a foreign frame
-that never returns cannot be ended (`design/execution.md`), and that is a
-statement about the world rather than a gap in the design.
+An operation that fails or completes synchronously at submission produces
+no completion on either completion backend — `IOSQE_CQE_SKIP_SUCCESS` on
+io_uring, a synchronous error or `FILE_SKIP_COMPLETION_PORT_ON_SUCCESS` on
+Windows. The submission path resolves those before the operation slot
+enters the owed-count protocol, so phase 2 never waits for a completion
+that was never queued.
 
-**Cancellation is idempotent.** A second request finds the mark set and
-returns. A request racing with the unit's own completion finds the
-generation changed and does nothing (`design/pool.md`).
+## The readiness backends are not free
+
+The first version of this document said there is nothing to cancel on
+kqueue and epoll because the syscall was never issued. That is wrong in
+three cases, and they are the cases that matter on the platforms which
+have only readiness backends — macOS and iOS on kqueue, Android on epoll,
+where io_uring is blocked.
+
+| Case | What is outstanding | What cancellation must do |
+|---|---|---|
+| registered, not yet signalled | nothing | deregister; the buffer is free at once |
+| signalled, syscall in progress | the reactor thread is inside `read` writing the buffer | wait for that syscall to return; deregistration retracts nothing |
+| file I/O on the thread pool | a blocking syscall against a possibly hung mount | wait for the pool thread; there is no cancel |
+| `connect` in progress | an in-kernel handshake | close the descriptor; deregistration does not stop it |
+
+So the two-phase shape is the same everywhere, and only the first row
+completes phase 2 inline. A readiness backend's "completion" is the
+reactor's own record that the syscall returned, which is what phase 2
+waits for.
 
 ## Timeouts
 
 A timeout is not a cancellation mechanism; it is an OR wait with a timer
-in it (`design/execution.md`). The timer firing makes the unit resume
-with a timeout result, and the read half is retired like any loser.
+in it (`design/execution.md`). The timer firing ends the wait with a
+timeout result and retires the other halves like any winner.
 
-The distinction matters because it is what keeps timeouts free of their
-own machinery: there is no timeout state, no timeout list per operation,
-and no second path through the reactor. Whoever wants a bounded wait arms
-a timer half.
+The distinction is what keeps timeouts free of their own machinery: no
+timeout state, no per-operation timeout list, no second path through the
+reactor.
 
 ## When a cancelled operation never completes
 
-The design above waits for the original completion, and there is no
-timeout on that wait, because the kernel does not offer one. An operation
-against a hung network filesystem can be outstanding for as long as the
-mount is hung, and its buffer and operation slot stay held.
-
-What the design does about it, and what it does not:
+Phase 2 has no timeout, because the kernel offers none. An operation
+against a hung mount stays outstanding as long as the mount does.
 
 - **The resources are accounted, not leaked.** The operation slot stays
-  live and the buffer stays pinned, both visible in the pools, so a walk
-  reports them (`design/pool.md`). A hundred stuck operations are a
-  hundred slots a diagnostic can name, not memory that vanished.
+  live and its buffer stays pinned, both visible in the pools, so a walk
+  names them (`design/pool.md`).
 - **The unit does not wait for them.** It resumed on the cancelled result
-  in phase 1 and may complete, die, and have its slot reused. The
-  operation holds what it needs on its own.
+  the moment the state word moved, and it may complete and have its slot
+  reused; the operation holds what it needs on its own.
 - **There is no forced reclamation.** Unmapping a buffer the kernel may
-  write into is not available. A process with enough stuck operations
-  exhausts its buffer pool and stops accepting work, which is a bounded
-  and reportable failure rather than corruption.
-
-## Backend differences
-
-| Backend | Cancel request | Does the original still complete? | Buffer released on |
-|---|---|---|---|
-| io_uring | `IORING_OP_ASYNC_CANCEL` or `IORING_REGISTER_SYNC_CANCEL` | yes, always | the original completion |
-| IOCP | `CancelIoEx` | yes, with `ERROR_OPERATION_ABORTED` or the real result | the original completion |
-| kqueue, epoll | deregister the descriptor | there is no original: nothing was submitted | immediately |
-
-The readiness backends make cancellation cheap and the completion
-backends make it two-phase, which is the reverse of how the rest of the
-substrate ranks them. It is the one place where readiness is the simpler
-world, and the API hides the difference by always going through the same
-two phases — on kqueue and epoll, phase 2 completes inline.
+  write into is not available. Enough stuck operations exhaust the buffer
+  pool and the process stops accepting work — bounded and reportable,
+  rather than corrupt.
 
 ## Shutdown
 
-Ending a whole scope, an actor, or the process is cancellation applied to
-a set, and it inherits every limit above. In particular a shutdown does
-not wait for cancelled operations to complete before the process exits;
-it waits only for the units. An operation still in flight at exit is
-abandoned to process teardown, which is safe because the address space
-goes with it.
+Ending a scope, an actor, or the process is final cancellation applied to
+a set, and it inherits every limit above.
 
-What is not safe is exiting while a registered buffer pool is still
-registered with a ring that outlives the process image — which cannot
-happen, and is recorded here only so that a future backend with a
-kernel-persistent ring does not quietly break it.
+**Exit does not wait for cancelled operations, and cannot fully avoid
+waiting either.** Tearing down an io_uring ring waits for its in-flight
+requests, and Windows process teardown waits for drivers to complete
+cancelled IRPs. An operation stuck in an uninterruptible stage therefore
+delays exit no matter what this design does. The honest statement is that
+shutdown waits for units and abandons operations, and that the kernel may
+still hold the process in teardown afterwards.
 
 ## Decided elsewhere
 
 | Question | Document |
 |---|---|
-| the wait record, the epoch, and `wake` | `design/execution.md` |
-| operation slots and what they pin | `design/pool.md` |
-| how an operation is submitted and completed | `design/reactor.md` |
-| who is chosen as a victim, and what happens if it is unkillable | `design/deadlock.md` |
+| the state word, the epoch, the park order, `wake` | `design/execution.md` |
+| operation slots and their owed-completion count | `design/pool.md` |
+| how operations are submitted and completed | `design/reactor.md` |
+| who is chosen as a victim | `design/deadlock.md` |
 
 ## Open questions
 
-- **A bound on stuck operations.** The design accounts for them and does
-  not bound them. A watermark that refuses new submissions on a
-  descriptor with too many outstanding cancels would turn a slow
-  exhaustion into an early error, and it is not designed.
-- **Whether `IORING_REGISTER_SYNC_CANCEL` is worth a second path.** It
-  answers inline, which suits shutdown, and it is a different code path
-  from the ordinary cancel. Unmeasured.
-- **Cancelling a multishot operation.** It has many completions, so
-  "wait for the original completion" needs a definition: presumably the
-  completion without `IORING_CQE_F_MORE`, but the ordering against
-  queued-but-undelivered completions in the socket's slot
-  (`design/reactor.md`) is not worked out.
-- **Cancellation of a unit that has not yet been mounted.** The mark is
-  in the slot and the handle is in a run queue; nothing dequeues it early,
-  so it is mounted, resumes, and immediately unwinds. That wastes a mount
-  and is probably fine, but it has not been compared against a queue scan.
+- **A bound on stuck operations.** Accounted, not bounded. A watermark
+  that refuses new submissions on a descriptor with too many outstanding
+  cancels would turn slow exhaustion into an early error.
+- **Cancelling a multishot operation.** Its owed count is unknown until
+  the series ends, so "release when the count reaches zero" needs a rule
+  for a series that a cancel truncates, and an ordering against
+  completions already queued in the socket's slot
+  (`design/reactor.md`).
+- **`IORING_REGISTER_SYNC_CANCEL`'s kernel floor**, which matters on
+  Android and on older long-term kernels, is not established here.
+- **A created-but-unmounted unit** holds none of the four states and has
+  no wait record, so the cancelled bit is all a cancel can set. It is
+  mounted, resumes, and unwinds immediately, which wastes a mount and has
+  not been compared against scanning the run queue.
