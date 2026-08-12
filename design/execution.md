@@ -3,10 +3,23 @@
 ## What a unit is
 
 An execution unit is one resumable flow of control: a suspension state,
-a wait record, and a handle the scheduler can queue. It is neither a
+a wait record, and a reference the scheduler can queue. It is neither a
 thread nor an actor. A thread runs whatever unit the scheduler mounts on
 it; an actor owns memory and a mailbox and *runs on* a unit for the
 duration of one message.
+
+**A unit is an ordinary runtime object** — entity kind 0, with a class
+the runtime builds, an `RcHeader` at offset zero, and a reference count
+for its lifetime (`dev/DECISIONS.md`, 2026-08-12). An ordinary unit is
+allocated in its thread's heap and never leaves that thread; an actor's
+unit is allocated in the actor's arena and travels with the actor. The
+stack and machine registers are a separate pooled object rather than part
+of the unit.
+
+**Only its own thread ever touches a unit.** A signal from another thread
+is delivered to that thread's reactor, which runs there and touches the
+unit on its behalf. This invariant is what the parking protocol below is
+written against, and it is why that protocol needs no atomic operation.
 
 The substrate owns three things about a unit and nothing else: how it
 suspends, how it is resumed, and what it is waiting for. What it computes,
@@ -37,20 +50,21 @@ a foreign frame has nowhere to return `Pending` to.
 
 ## One handle, two kinds
 
-The scheduler queues one handle type: a 64-bit word naming a pool, a slot
-and the generation that slot held when the handle was taken
-(`design/pool.md`). It is not a pointer, and it carries no flags — the
-suspension kind is a field of the slot, which dispatch reads anyway.
+The scheduler queues one thing: a counted reference to a unit. Whoever
+arms a half of a wait holds one too, so the unit cannot be freed
+underneath a wake that is still on its way. The suspension kind is a
+field of the unit, which dispatch reads anyway.
 
-The wake path never inspects the kind: it moves a handle to a run queue.
-Dispatch reads the kind once, on mount, and branches to one of two resume
-routines. Everything downstream of that branch differs; everything
+The wake path never inspects the kind: it moves a reference to a run
+queue. Dispatch reads the kind once, on mount, and branches to one of two
+resume routines. Everything downstream of that branch differs; everything
 upstream is common, which is what keeps the two kinds from becoming two
 schedulers.
 
-The generation in the handle is what lets a waker tell "this unit's wait"
-from "whatever occupies that slot now". Without it a wake arriving after
-the unit completed would act on a stranger.
+An earlier version of this document used a 64-bit word naming a pool
+slot and a generation. It is retired: a coroutine is a refcounted object,
+and the reference count does the job the generation was invented for
+(`dev/DECISIONS.md`, 2026-08-12).
 
 ## Stackful units
 
@@ -93,16 +107,16 @@ Every other difference from a stackful resume follows from that.
 `waker` is one function, callable from any thread:
 
 ```
-wake(unit: Handle, half: u32, epoch: u64, result: Result)
+wake(unit, half: u32, epoch: u64, result: Result)
 ```
 
-The unit passes it to whatever will end the wait. `unit` is the 64-bit
-handle, generation included, so the call can tell this unit from whatever
-occupies its slot later. `half` names which entry of the wait record is
-being ended, `epoch` is the value the record carried when that half was
-armed, and `result` is what the unit reads after it resumes. The
-algorithm is in "Waking", and it is the same call the reactor makes on a
-completion (`design/reactor.md`).
+The unit passes it to whatever will end the wait, together with a counted
+reference to itself, which is what keeps it alive until the call arrives.
+`half` names which entry of the wait record is being ended, `epoch` is
+the value the record carried when that half was armed, and `result` is
+what the unit reads after it resumes. The algorithm is in "Waking", and
+it is the same call the reactor makes on a completion
+(`design/reactor.md`).
 
 ### The worker stack is a bound, not a computation
 
@@ -117,112 +131,92 @@ is, and overflow is a fault rather than a computed impossibility.
 ## Parking
 
 Every suspension goes through one primitive, and its steps are ordered.
-The order is the protocol: a wait armed before the state moves would let a
-completion arrive with nowhere to record itself.
+The order is still the protocol, but it no longer defends against another
+thread: a unit is touched only by its own thread, so the steps are plain
+stores and the wake that could once arrive mid-suspension cannot.
 
-1. **Enter `Parking`.** The unit stores `Parking` into its state word.
-2. **Write the record as a seqlock.** Make the `epoch` odd, write the
-   entries, the mode and `remaining`, then make it even. The epoch is
-   both the wait's identity and the sequence number a reader uses to know
-   the entries belong to one wait (`design/pool.md`). Writing the epoch
-   first, as an earlier version did, lets a reader take the new entries
-   under the old epoch and compose a wait that never existed.
-3. **Arm each half.** Submit the operation, send the message, arm the
-   timer — each carrying the waker, its half index, and the epoch from
-   step 2. Arming after step 1 is what makes `Running` unreachable for a
-   waker.
-4. **Suspend.** A stackful unit switches to the worker. A stackless unit
+1. **Write the record.** A fresh `epoch`, the entries, the mode, and
+   `remaining` for an AND wait.
+2. **Arm each half.** Submit the operation, send the message, arm the
+   timer — each carrying the unit, its half index, and the epoch from
+   step 1. Arming after the record is written is what guarantees a
+   completion finds somewhere to record itself.
+3. **Suspend.** A stackful unit switches to the worker. A stackless unit
    returns `Pending` from `poll`.
-5. **Publish `Parked` — from the worker, never from the unit.** After the
-   switch has completed, or after `poll` has returned, the worker
-   compare-and-swaps `Parking` to `Parked`. Publishing from the unit
-   would announce a context that is still being saved, and a waker acting
-   on that announcement would mount a half-saved unit on a second thread.
+4. **Mark `Parked`.** After the switch has completed, or after `poll` has
+   returned, the worker stores `Parked`. It is the worker rather than the
+   unit because a unit that announced itself parked while its machine
+   context was still being saved would be resumable before it was
+   savable, which is a bug even on one thread.
 
-If the worker's compare-and-swap fails, a wake arrived during the
-suspension — the state is `Woken`, or the cancelled bit is set, and the
-two are handled alike. The worker then enqueues the handle itself. A
-stackful unit is already suspended and resumes normally. A stackless unit
-is re-polled, which is correct because its frames unwound when `poll`
-returned and its state machine holds everything it needs.
-
-This swap is also the one place the cancelled bit is checked, so a unit
-that begins parking after a cancel was requested does not sleep
-(`design/cancellation.md`). No separate check and no separate ordering is
-introduced for it.
+If a half completed inline during step 2 — the reactor's submission
+returned a result at once, the mailbox already held the reply — the unit
+does not suspend at all: step 3 is skipped and it continues.
 
 Nothing else in the system may register a wait. A wait recorded outside
 this primitive is invisible to the deadlock detector, and its absence is
 not detectable from the outside (`dev/DECISIONS.md`, 2026-08-12).
+
+**What this used to be, and why it changed.** Earlier versions gave every
+transition a compare-and-swap, made the record a seqlock and had the
+worker's swap fail when a wake had arrived. All of it existed to resolve
+a race between a waker on another thread and a unit still suspending, and
+that race does not exist: a completion returns on the ring of the worker
+that submitted it, an actor's reply arrives as a message in its own
+mailbox, and a signal from another thread goes to the reactor rather than
+to the unit (`dev/DECISIONS.md`, 2026-08-12). The atomics come back the
+day something else may wake a unit across a thread boundary, and the
+retired protocol is the design for that day.
 
 ## Parking states
 
 | State | Meaning |
 |---|---|
 | `Running` | mounted on a thread and executing |
-| `Parking` | record written and halves armed; the suspension is not finished |
-| `Parked` | the suspension is finished and no thread holds the unit |
+| `Parked` | the suspension is finished and the unit is waiting |
 | `Woken` | a wake has been accepted; the unit is owed one run queue slot |
 
-Every transition is a compare-and-swap with acquire-release ordering. No
-transition is a plain store, because two of them race by design:
-`Parking → Parked` is attempted by the worker while `Parking → Woken` is
-attempted by a waker.
+Every transition is a plain store, because one thread performs all of
+them. There were four states and a compare-and-swap on each while a wake
+could arrive from another thread; that case is gone, and `Parking` went
+with it.
 
-| From | To | By | Then |
-|---|---|---|---|
-| `Running` | `Parking` | the unit | writes the record, arms the halves |
-| `Parking` | `Parked` | the worker | nothing; the unit sleeps |
-| `Parking` | `Woken` | a waker | nothing; the worker's failed swap enqueues |
-| `Parked` | `Woken` | a waker | the waker enqueues |
-| `Woken` | `Running` | the scheduler | mounts and resumes |
+| From | To | By |
+|---|---|---|
+| `Running` | `Parked` | the worker, after the suspension has finished |
+| `Parked` | `Woken` | whoever ends the wait; it also enqueues |
+| `Woken` | `Running` | the scheduler, mounting and resuming |
 
-**Exactly one enqueue per wake.** The two enqueue paths are the worker's
-failed swap and the waker's successful `Parked → Woken`, and the same
-compare-and-swap decides which of them happens. A handle therefore cannot
-be in two queues.
-
-**A waker never observes `Running`.** The halves are armed in step 3, after
-`Parking` is published in step 1, so nothing can call `wake` while the
-state word still reads `Running`.
+**Exactly one enqueue per wake**, because exactly one caller moves
+`Parked → Woken` and a second finds `Woken` already set and returns.
 
 ## Waking
 
-`wake(data, half, epoch, result)` runs on whatever thread ended the wait,
-and it does five things in order.
+`wake(unit, half, epoch, result)` runs on the unit's own thread — the
+reactor drains its worker's completions there, a mailbox is read by its
+actor's thread, and a signal from elsewhere reaches the reactor rather
+than the unit. It does five things in order.
 
-1. **Validate the handle and the epoch.** Resolve the handle: a changed
-   generation means the slot belongs to someone else and the call
-   returns. Then read the record with acquire and compare its epoch with
-   the argument. A mismatch means this half was retired and the unit has
-   since parked on something else. Without the epoch check a loser of a
-   previous OR wait, firing between the win and the retirement, would wake
-   the unit out of an unrelated wait with no half fired at all; without
-   the generation check the same wake would land on a different unit
-   entirely.
+1. **Validate the epoch.** Compare the record's epoch with the argument.
+   A mismatch means this half was retired and the unit has since parked
+   on something else, so the call returns. Without it a loser of a
+   previous OR wait, firing between the win and the retirement, would
+   wake the unit out of an unrelated wait with no half fired at all.
 
-   Validating is not atomic with the writes that follow, so a slot
-   released between the two would take those writes. That is why a
-   released slot is not handed out until every worker has passed a
-   quiescent point (`design/pool.md`): the late writes land in memory
-   nobody owns, and step 5 then fails against a free state word.
-2. **Store the result** into the half's slot in the record. This is the
-   only write a waker makes to the record besides the counter below, and
-   the state word's release on the next steps is what publishes it.
-3. **Decide whether the wait is over.** Under **OR**, claim the win with a
-   compare-and-swap on the winner field; a waker that loses the claim
-   returns. Under **AND**, decrement `remaining`; a waker that does not
-   take it to zero returns.
-4. **Retire the other halves** through their cancel handles. Retirement is
-   asynchronous, so a retired half may still fire; the epoch check in step
-   1 is what makes that harmless.
-5. **Move the state word.** `Parking → Woken` leaves the enqueue to the
-   worker; `Parked → Woken` enqueues here. Finding `Woken` already set
-   means another half arrived first under a mode that permits it, and the
-   call returns.
+   The unit itself cannot be gone: whoever armed the half holds a
+   counted reference to it, so it is alive for as long as the wake can
+   arrive.
+2. **Store the result** into the half's entry.
+3. **Decide whether the wait is over.** Under **OR**, claim the winner
+   field; a caller that finds it claimed returns. Under **AND**,
+   decrement `remaining`; a caller that does not take it to zero returns.
+4. **Retire the other halves** through their cancel handles. Retirement
+   is asynchronous, so a retired half may still fire; the epoch check in
+   step 1 is what makes that harmless.
+5. **Move the state word** from `Parked` to `Woken` and enqueue.
 
-Steps 1 through 4 are what make wakes safe to repeat. Step 5 is what makes
-them arrive exactly once.
+Steps 1 through 4 are what make wakes safe to repeat. Step 5 is what
+makes them arrive exactly once.
 
 ## The wait record
 
@@ -266,17 +260,18 @@ records exactly that half (`dev/DECISIONS.md`, 2026-08-12). Here the other
 half lives in the resource, which is what keeps it true as ownership
 moves.
 
-**Writers and readers.** The unit writes the record while `Running`, in
-step 2 of parking. A waker writes one result slot and one counter, in the
-order above. The deadlock detector reads records of units it found in
-`Parked` and writes nothing.
+**Writers and readers.** The record is written and read by the unit's own
+thread and by nothing else: the unit writes it while `Running`, and
+whoever ends a wait writes one result and one counter, on that same
+thread.
 
-**The detector must validate, not merely observe.** Reading the state word
-with acquire makes a record visible, and visibility is not stability: a
-unit can wake, run, and park again on a different wait between two of the
-detector's reads. A reader that spans more than one field re-reads the
-epoch afterwards and discards the result if it changed. Without that, two
-halves of two different waits combine into a cycle that never existed.
+**The one reader from outside is the collector**, which is where deadlock
+detection now lives (`dev/DECISIONS.md`, 2026-08-12). It reads the record
+under the discipline the collector already has for reading a running
+mutator's memory — block snapshots and a re-read of each recorded cell in
+a later phase — rather than under a discipline of this document's
+invention. The seqlock an earlier version put here was for a cross-thread
+reader that does not exist.
 
 ## Mount and unmount
 
@@ -329,72 +324,64 @@ defect of the actor model rather than of the substrate, and it belongs in
 `rfc/BACKLOG.md`, which does not yet carry it — the substrate is only
 where it becomes visible.
 
-## Thread-local storage and pinning
+## Thread-local storage, and who may move
 
-**Our rule:** no thread-local address is cached across a suspension point.
-A unit reaches its context through the unit, not through a register that
-happened to hold a TLS address before the switch. After migration that
-address belongs to the previous thread, and the arena it names belongs to
-another actor.
+**Only an actor ever moves between threads.** An ordinary unit shares its
+thread's memory and is allocated in that thread's heap, so it is pinned
+for life — a consequence of where its memory is, not a scheduling policy
+(`dev/DECISIONS.md`, 2026-08-12). Everything in this section is therefore
+about actors, and about them only.
 
-**The rule has no enforcer today.** The substrate's own Rust is compiled
-by rustc, and rustc offers no way to state "do not keep this TLS address
-across this call". Whether LLVM in fact hoists a `thread_local!` address
-across a suspension point is not measured here, and that is the point: a
-rule that can be neither enforced nor checked is the contract `may` states
-openly by marking spawn unsafe. What the design does instead is remove the
-opportunity — the context is reached through the unit on every path that
-can suspend, so no correct path needs a TLS address to survive a switch.
-A test that migrates a unit across threads between every pair of
-suspension points is owed at implementation.
+**Our rule:** no thread-local address is cached across a suspension
+point. A unit reaches its context through the unit, not through a
+register that happened to hold a TLS address before the switch. After a
+move that address belongs to the previous thread, and the arena it names
+belongs to another actor.
+
+**The rule has no enforcer today.** rustc offers no way to state "do not
+keep this TLS address across this call", and whether LLVM in fact hoists
+a `thread_local!` address across a suspension point is not measured here.
+What the design does instead is remove the opportunity: the context is
+reached through the unit on every path that can suspend, and a
+suspendable path carries no callee-saved registers at all
+(`design/switching.md`), so nothing survives a park in a register to
+begin with. That argument has not been checked against generated code,
+which is why it is a research item rather than a settled one.
 
 **Foreign frames are outside the rule entirely.** A C library suspended
 below our frame holds thread-local state we neither see nor move:
 `errno`, an OpenSSL error queue, a locale handle. Nothing of ours is
-broken when that state is read on the wrong thread after migration; it was
+broken when that state is read on the wrong thread after a move; it was
 simply left behind.
 
-**Pinning.** A unit is pinned to its thread while it is thread-affine, and
-the scheduler does not steal a pinned unit. Two things make a unit
-thread-affine:
-
-- a live foreign frame, counted by the same depth counter that decides
-  how much a context switch must preserve (`design/switching.md`),
-  incremented on entry to foreign code and decremented on return. It is a
-  counter rather than a flag because foreign code calls back into ours,
-  and the inner call's return would otherwise clear a marker that the
-  outer frame still needs;
-- a consumer that declares its own frames thread-affine, per unit at
-  creation. A consumer whose compiler we do not own knows what its code
-  keeps in thread-local storage, and the substrate does not. The default
-  for a C-ABI consumer is affine, because assuming otherwise breaks
-  `errno` silently; Limelight declares its own units migratable.
-
-The default costs work stealing for a consumer that never revisits it,
-which is the price of being wrong in the safe direction. A consumer that
-wants stealing declares it and takes the obligation.
+**When an actor may be re-mounted** is fixed in shape and open in detail
+(`dev/DECISIONS.md`, 2026-08-12): only where it has stopped — reading its
+mailbox, and waiting — and never while its foreign-frame counter is
+non-zero. Which waits qualify, and what a consumer over the C ABI
+declares about its own frames, is being researched. Until it closes, the
+implementation re-mounts an actor only at a message boundary, which is
+correct under every candidate answer.
 
 ## Migration and the single `unsafe impl Send`
 
-Migration is sound here because at most one thread executes a unit at any
-moment, and the scheduler handoff that moves it carries the release and
-acquire pair that publishes its memory (`rfc/runtime/actors.md`). Rust
-cannot check this: the compiler cannot see a stackful unit's frames, so
-`corosensei` marks its coroutine `!Send` rather than guess.
+Moving an actor between threads is sound because at most one thread
+executes it at any moment, and the scheduler handoff that moves it
+carries the release and acquire pair that publishes its memory
+(`rfc/runtime/actors.md`). Rust cannot check this: the compiler cannot
+see a stackful unit's frames, so `corosensei` marks its coroutine
+`!Send` rather than guess.
 
-The assertion lives in our code, in one place: the handle type in the
+The assertion lives in our code, in one place: the actor handle in the
 scheduler carries a single `unsafe impl Send`, with the invariant above
-written over it and the pinning rule as its precondition.
+written over it and the foreign-frame counter as its precondition. An
+ordinary unit needs no assertion at all, because it never crosses.
 
-A stackless unit written in Rust inside the substrate needs no assertion,
-because rustc computes `Send` for its state machine the ordinary way. A
-stackless unit produced by the Limelight compiler is not covered by that:
-to rustc its state is an opaque block behind size, alignment, `poll` and
-`drop`, and no inference applies to it. Such a unit is migratable only
-when its producer declares it so through `is_thread_affine`, and that
-declaration is the second `unsafe` contract in the system. There are
-exactly two, and both are stated at the point where a unit crosses into
-the scheduler.
+A stackless unit written in Rust inside the substrate needs none either,
+since rustc computes `Send` for its state machine the ordinary way. One
+produced by the Limelight compiler is not covered by that: to rustc its
+state is an opaque block behind size, alignment, `poll` and `drop`. Such
+a unit crosses only when its producer declares that it may, and that
+declaration is the second `unsafe` contract in the system.
 
 ## Restrictions on a stackless unit
 
