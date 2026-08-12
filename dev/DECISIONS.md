@@ -255,3 +255,34 @@ drains and all I/O stops.
 Recorded as its own entry rather than as an edit, because the original
 reasoning is what a reader will meet first and the correction has to be
 visible next to it.
+
+## 2026-08-12 — A coroutine is an entity, always in the GC heap
+
+A coroutine is an ordinary runtime entity: an `RcHeader` at offset zero,
+its own entity kind, allocated by the Limelight memory manager
+(`limelight-lang/model`). Its lifetime is its reference count, the
+existing heap enumerator lists it, and the existing tracer walks its
+children. The stack and registers are a **separate** pooled object, as
+`async_fiber_context_t` is in TrueAsync: stacks are expensive and
+reusable, coroutines are cheap and numerous.
+
+Category: the GC heap, always, even though a coroutine could live in a
+request arena like any other object. Choosing one category removes the
+question of what happens when a reference to a coroutine is held from
+outside while its arena dies — and a parked coroutine is referenced from
+outside by construction, because something has to wake it.
+
+Cost: one heap allocation per message rather than a bump in the arena,
+and a coroutine is subject to cycle collection instead of dying with its
+arena in O(1). Both are accepted for the first implementation and are
+revisitable once there is something to measure.
+
+Rejected, and this is a correction rather than a choice: a bespoke array
+of fixed slots addressed by index and generation, which earlier documents
+in this repository describe. It solved "how does a late wake know its
+coroutine is gone", and the reference count solves that already — whoever
+armed a half holds a reference, so the coroutine cannot die underneath it.
+Deferred reclamation went with it. What survives is the parking protocol
+itself: four states, the order state-record-arm, the seqlock over the wait
+record, and the epoch identifying one wait. Those are about races inside
+one coroutine's life, not about its lifetime.
