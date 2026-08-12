@@ -400,3 +400,51 @@ Until this closes, the implementation forwards every completion to the
 owning thread. That is correct under either answer and costs the
 forwarding path, which exists anyway for cross-thread cancels
 (`design/reactor.md`).
+
+## 2026-08-12 — A coroutine is single-threaded; the detector rides the collector
+
+Two decisions that belong together, because the first is what makes the
+second necessary.
+
+**Only its own thread ever touches a coroutine.** A signal from another
+thread is delivered to that thread's Reactor, which runs on that thread
+and touches the coroutine there. The coroutine is never the cross-thread
+door.
+
+What this retires from the design documents, which still describe it: the
+compare-and-swap on every parking transition and the `Parking` state
+itself, the seqlock over the wait record, and the generation check on the
+wake path. All three existed to resolve a race between a waker on another
+thread and a coroutine still suspending, and that race does not exist.
+Parking becomes ordinary stores. The **epoch survives**, for its other
+job: telling this wait from the previous one, so a retired half that
+fires anyway does not wake the coroutine out of an unrelated wait.
+
+**Deadlock detection rides the collector.** One pass does both: it finds
+cycles and it frees memory. The collector already reads other threads'
+entities safely — block snapshots, epoch bytes, a re-read of each
+recorded cell in a later phase — and the detector inherits that instead
+of duplicating it. The single-thread invariant stays intact, because the
+collector is the one reader that crosses by right.
+
+**Detection runs in the walk phase, never after mark termination.**
+Termination waits for every actor to answer a handshake, and an actor
+parked in a deadlock never reaches a message boundary, so it never
+answers. A detector placed after termination would be blocked by exactly
+the condition it exists to find. The walk needs no answers: it reads
+snapshots.
+
+Open:
+
+- **The trigger.** A deadlocked set allocates nothing, so nothing about
+  it makes the collector run. Either the wait-age watchdog also starts an
+  epoch, or the collector runs on a schedule of its own. Undecided.
+- **Latency.** Detection now happens at collector granularity rather than
+  at wait-age granularity, which may be seconds rather than the second
+  PostgreSQL uses. Whether that is acceptable is a question for Edmond
+  and not for the design.
+- **What the detector needs that the collector does not.** The collector
+  reads counted edges; the detector reads the wait record — the resource,
+  the mode, which halves have fired. Whether the collector's walk yields
+  those for free through the `walk` hook, or the detector needs a second
+  reading pass, is not worked out.
