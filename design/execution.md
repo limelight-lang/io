@@ -439,8 +439,9 @@ counter, because an AND wait's counter would swallow it: a waker that does
 not take `remaining` to zero returns without waking, and a cancelled unit
 would sleep forever waiting for halves that were just retired.
 
-The state machine stays four states wide. The bit is a modifier on the
-transitions that already exist, not a fifth state.
+The bit is a modifier on the transitions that already exist, not a state
+of its own. It is set by the unit's own thread, because a cancel raised
+elsewhere reaches that thread's reactor first.
 
 ### A unit always ends itself
 
@@ -458,8 +459,11 @@ victim instead of repeating itself (`design/cancellation.md`).
 
 ## Decided elsewhere
 
-These documents are not yet written; the plan lists them in order
-(`dev/PLAN.md`).
+All of these exist. Where any of them still describes the retired
+machinery — a handle carrying a slot and a generation, deferred slot
+reclamation, a compare-and-swap on every parking transition, a seqlock
+over the wait record — `dev/DECISIONS.md` of 2026-08-12 is what holds,
+and the correction is listed in `dev/INDEX.md`.
 
 | Question | Document |
 |---|---|

@@ -23,6 +23,22 @@ No product code yet. The design is being written first, stage by stage
 - **Pitfalls already hit** → [POSTMORTEM.md](POSTMORTEM.md)
 - **Diagrams** → [design/](design/) — PlantUML sources, no rendered images
 
+## Corrections of 2026-08-12, not yet applied to every document
+
+The design documents were written before the coroutine's shape was
+settled against `limelight-lang/model`. Four things in them are retired,
+and `dev/DECISIONS.md` of that date is what holds where they disagree:
+
+| Retired | What holds instead | Still stale in |
+|---|---|---|
+| a 64-bit handle carrying a pool slot and a generation | a counted reference to the coroutine object | `design/pool.md` |
+| slots in a bespoke array, with deferred reclamation | the coroutine is an entity in the memory manager; pools remain for sockets, timers, operations and buffers | `design/pool.md` |
+| a compare-and-swap on every parking transition, and the `Parking` state | plain stores: a unit is touched only by its own thread | `design/cancellation.md` |
+| a seqlock over the wait record, and generation checks on the wake path | the epoch alone, for telling this wait from the previous one | `design/deadlock.md`, `README.md` |
+
+`design/execution.md`, `design/switching.md` and `design/stacks.md` are
+already corrected. Applying the rest belongs to the architecture stage.
+
 ## Design documents
 
 Written in the order below; each is listed here once it exists.
