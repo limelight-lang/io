@@ -165,11 +165,34 @@ rules and their behaviour on each of the four backends.
         cancelled operation (its own plus the cancel's). And the step's
         own criterion was unmet: only the unit slot was laid out. Accepted
         in full; document rewritten, execution.md patched in four places.
-- [ ] S3.2 `design/reactor.md`
+- [x] S3.2 `design/reactor.md`
       done: the document states the completion-first API, the three
         buffer contracts, how each degrades on IOCP, kqueue and epoll,
         and where zero-copy applies
       tier: T2 · role: Critic
+      Critic 2026-08-12 round 1: twenty-one findings, six high, most of
+        them kernel facts rather than design. A zero-copy send posts its
+        notification only when the first completion carries
+        `IORING_CQE_F_MORE`, so the unconditional two-completion rule
+        stranded a buffer on every failed send — corrected here and in
+        DECISIONS. Multishot completions were being validated against a
+        unit's epoch, which is stale after the unit's first re-park, so
+        every chunk after the first would have been discarded; they target
+        the socket now. Parking on the socket's queue lost wakeups for
+        want of an arm-time recheck. The series ends routinely on
+        `-ENOBUFS` and on completion-ring overflow — at peak load, not at
+        idle — and nobody owned resubmission. Submission-queue ownership
+        was unstated, and the shared-ring reading hangs: without a polling
+        thread, entries written by another worker while the owner sleeps
+        are never submitted, so there is one ring per worker. Buffer
+        ownership after a retired half was stated twice and
+        contradictorily; the buffer belongs to the operation, never to the
+        caller. Below those: `splice` needs a pipe so the io_uring path is
+        the expensive one, IOCP reaches contract 3 through a zero-length
+        receive, readiness backends must synthesize a completion for a
+        cancel or leak a buffer per timed-out read, and io_uring's
+        features span 5.19 to 6.15 and need per-feature degradation.
+        Accepted in full; document rewritten.
 - [x] S3.3 `design/cancellation.md`
       done: the document states the two-phase teardown and the condition
         under which a stack and a buffer return to their pools

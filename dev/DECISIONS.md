@@ -236,3 +236,22 @@ uses and which cannot see a cycle inside a busy process.
 
 Cost: a full pool scan still exists, but only for the human-facing
 diagnostic dump, and it is not on the detector's path.
+
+## 2026-08-12 — Correction: a zero-copy send does not always post two completions
+
+The completion-first entry above states that `IORING_OP_SEND_ZC` returns
+two completions. That is true only when the first completion carries
+`IORING_CQE_F_MORE`. A send that fails posts one completion and no
+notification ever follows.
+
+The decision it was given as a reason for stands: "operation finished" and
+"buffer returned" are still two events in the contract. What changes is
+how many the code waits for — an operation's owed-completion count is read
+from the first completion's flags rather than fixed at two
+(`design/reactor.md`, `design/pool.md`). Fixing it at two strands one pool
+buffer on every failed zero-copy send, and under connection churn the pool
+drains and all I/O stops.
+
+Recorded as its own entry rather than as an edit, because the original
+reasoning is what a reader will meet first and the correction has to be
+visible next to it.

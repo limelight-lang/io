@@ -4,10 +4,7 @@
 
 The reactor submits operations to the operating system and delivers their
 completions to the units waiting on them. It is one crate, `io-reactor`,
-depending on `io-core` and never the reverse (`dev/ARCHITECTURE.md`). A
-completion is delivered by the same `wake(data, half, epoch, result)`
-call a stackless unit's waker uses, so the reactor knows nothing about
-how a unit suspends (`design/execution.md`).
+depending on `io-core` and never the reverse (`dev/ARCHITECTURE.md`).
 
 ## The API is completion-first
 
@@ -15,207 +12,275 @@ An operation names what to do, what memory to do it with, and who to wake.
 It does not report readiness.
 
 ```
-io_read (unit_half, fd, buffer, offset) -> submitted
-io_write(unit_half, fd, buffer, offset) -> submitted
+io_read (waiter, fd, buffer, offset) -> operation handle
+io_write(waiter, fd, buffer, offset) -> operation handle
 ```
 
-The result — bytes transferred, or an error — arrives in the wait
-record's result slot when the operation completes.
+The result — bytes transferred, or an error — arrives in the wait record's
+result slot when the operation completes.
 
-**Why this direction and not readiness.** io_uring and Windows IOCP are
-completion-based, and readiness backends emulate completion by issuing
-the syscall when the descriptor signals. The reverse emulation loses what
-io_uring is for: a readiness API on top of it would submit a poll, wake,
-and then submit the real operation, paying two round trips where the
-native shape pays one. Files make the asymmetry sharper — a regular file
-is always "ready" under kqueue and epoll, so a readiness API cannot
-express file I/O at all and every runtime built on one ends up with a
-thread pool behind it.
+**Why this direction.** io_uring and Windows IOCP are completion-based,
+and readiness backends emulate completion by issuing the syscall when the
+descriptor signals. The reverse emulation costs two round trips where the
+native shape costs one. Regular files sharpen it: `epoll_ctl` rejects a
+regular file outright with `EPERM`, and kqueue's read filter on a vnode
+reports bytes-to-EOF while a read still blocks on a page-cache miss. A
+readiness API cannot express file I/O, which is why every runtime built on
+one has a thread pool behind it.
 
 io_uring is a backend and not the foundation (`dev/DECISIONS.md`,
 2026-08-12): Android blocks it from applications through seccomp-bpf,
 ChromeOS disables it, and the default seccomp profiles of Docker and
 containerd reject it.
 
+## One ring per worker
+
+Each worker owns its own submission and completion queues. A unit submits
+on the worker it is mounted on, and that worker drains its own
+completions.
+
+Anything crossing a worker boundary — a cancel from another thread, an
+operation whose unit migrated — is posted to the owner's intake queue and
+submitted on its next turn; the owner is woken through its wake
+descriptor if it is blocked in the kernel. A single shared ring was the
+alternative and it hangs: without a polling thread, `io_uring_enter`
+submits only what is queued at the moment of the call, so entries written
+by another worker while the owner sleeps are never submitted at all.
+
+Submissions are batched and flushed once per turn. Two failures have to be
+handled rather than assumed away: the submission ring can fill inside one
+turn, and `io_uring_enter` can return `-EBUSY` when the completion ring is
+overflowing. Both mean "submit what fits, drain completions, retry", and
+neither may drop an operation on the floor.
+
 ## Three buffer contracts
 
 The buffer is part of the contract, because the kernel owns it from
-submission until completion. The three forms are not conveniences; they
-are three ownership rules, and each maps to a different kernel mechanism.
+submission until it says otherwise. The three forms are three ownership
+rules, each mapping to a different kernel mechanism. None accepts a stack
+address (`dev/DECISIONS.md`, 2026-08-12).
 
-None of them accepts a stack address. Everything the kernel touches comes
-from the buffer pool (`dev/DECISIONS.md`, 2026-08-12).
+**In all three, the buffer belongs to the operation and not to the
+caller.** The operation slot pins it and releases it when the kernel owes
+nothing more (`design/pool.md`). A caller never returns a buffer it
+handed to an operation, and in particular the loser of an `await` with a
+timeout returns nothing: its read is still in the kernel, and the
+operation that owns the buffer is what remembers.
 
 ### Contract 1 — the caller names a buffer
 
-The caller takes a buffer from the pool and passes it. The kernel owns it
-from submission until the completion arrives; the caller may not read,
-write, or release it in between, and cancelling does not shorten that.
+The caller takes a buffer from the pool and passes it. Native everywhere:
+`IORING_OP_READ` and `WRITE`, `ReadFile` and `WriteFile` with an
+OVERLAPPED, or the plain syscall issued on readiness.
 
-Native on every backend: `IORING_OP_READ` and `WRITE`, `ReadFile` and
-`WriteFile` with an OVERLAPPED, or the plain syscall issued on readiness.
+### Contract 2 — a vector, or a registered pool
 
-### Contract 2 — the caller names several buffers, or a registered pool
-
-A vector of buffers, for a scatter or gather, and the same shape with the
-pool registered ahead of time.
-
-Registration is what makes it worth a separate contract.
-`IORING_REGISTER_BUFFERS` pins the pool's pages once, and operations then
-name a buffer by index instead of by address, so the kernel skips the
-per-operation page lookup. This is only possible because pool slabs do
-not move (`design/pool.md`). Windows takes the same shape as a `WSABUF`
-array; readiness backends issue `readv` or `writev`.
-
-A consumer whose memory manager cannot promise stable slabs gets contract
-2 without registration, which costs the page lookup and nothing else.
+Several buffers for a scatter or gather, and the same shape with the pool
+registered ahead of time. `IORING_REGISTER_BUFFERS` pins the pages once
+and operations name a buffer by index, which is possible only because
+slabs do not move (`design/pool.md`). Windows has registered buffers
+through RIO; whether to use it is a scoping decision this project has not
+made, so the Windows backend starts with a `WSABUF` array. Readiness
+backends issue `readv` or `writev`.
 
 ### Contract 3 — the kernel names the buffer
 
 The caller registers a ring of buffers and submits an operation without
-one. The kernel picks a buffer when data arrives and reports which it
-used; the caller reads it and returns it to the ring.
+one; the kernel picks a buffer when data arrives and reports which.
 
-This is `IORING_REGISTER_PBUF_RING`, available since Linux 5.19. The ring
-holds a power-of-two number of entries, at most 32 768. The completion
-carries the buffer index in its flags, and `IOU_PBUF_RING_INC` lets a
-buffer be consumed incrementally rather than whole. `IORING_CQE_BUF_MORE`
-says the kernel is not finished with the buffer, so the caller may not
-return it yet; for any other provided-buffer type a completion that hands
-a buffer back is final.
+This is `IORING_REGISTER_PBUF_RING`, Linux 5.19. The ring holds a
+power-of-two number of entries, at most 32 768. `IOU_PBUF_RING_INC`
+(6.12) lets a buffer be consumed incrementally, and only for such a ring
+does a completion carry `IORING_CQE_F_BUF_MORE`, meaning the kernel is not
+finished with the buffer and it may not be returned yet.
 
 **This is the contract that scales to idle connections.** Under contracts
-1 and 2 a socket waiting for data holds a buffer for as long as it waits,
-so a hundred thousand idle connections hold a hundred thousand buffers.
-Under contract 3 they hold none, and the ring is sized for the traffic
+1 and 2 a socket waiting for data holds a buffer for as long as it waits.
+Under contract 3 it holds none, and the ring is sized for the traffic
 rather than for the connection count.
 
-It is also what makes multishot possible: one submission that produces
-many completions, each with its own buffer.
+Emulation elsewhere:
 
-Emulation elsewhere: on IOCP a buffer is taken from the pool at
-submission, so the API contract holds while the mechanism degrades to
-contract 1; on kqueue and epoll a buffer is taken when the descriptor
-signals, which is exactly what libuv's allocation callback does and is
-the readiness world's native shape.
+- **IOCP** reaches the same property by a different route: a receive
+  posted with a zero-length buffer completes when data arrives without
+  locking any memory, and the real buffer is taken then. This is the
+  standard Windows idiom for idle connections and the backend uses it,
+  because taking a buffer at submission would put a hundred thousand
+  buffers behind a hundred thousand idle sockets on one of the two
+  first-class platforms.
+- **kqueue and epoll** take a buffer when the descriptor signals, which is
+  the readiness world's native shape and what libuv's allocation callback
+  does.
 
 ## Multishot
 
-A multishot operation is submitted once and completes repeatedly:
-`accept` yielding connections, `recv` yielding datagrams or stream
-chunks. Each completion carries `IORING_CQE_F_MORE` while more are
-coming, and the absence of that flag ends the series.
+A multishot operation is submitted once and completes repeatedly: `accept`
+yielding descriptors, `recv` yielding chunks. Each completion carries
+`IORING_CQE_F_MORE` while more are coming.
 
-Multishot changes what a wait means, and the change belongs here rather
-than in `execution.md`. A unit cannot park on a multishot operation the
-ordinary way, because a wait record entry is retired when its half fires.
-A multishot operation therefore feeds a queue in its socket's slot, and
-the unit parks on the queue: the first completion that finds the queue
-empty and a unit parked wakes it, and later completions append. This
-keeps the wait record's one-shot semantics intact and puts the buffering
-where the socket already is.
+**A multishot operation targets a socket, not a unit.** Its completions
+append to a queue owned by the socket slot; they are not validated against
+a unit's epoch, because the unit re-parks between chunks and any
+unit-scoped validation would discard everything after the first. The
+queue's entries come from a pool of completion records, with head and tail
+in the socket slot, so a fixed-size slot holds an unbounded series.
+
+**Parking on the queue is an ordinary park with a recheck.** The unit
+writes its wait record naming the socket, publishes itself as the queue's
+waiter, and then re-reads the queue: non-empty means abandon the
+suspension and continue. Without that recheck a completion landing between
+the drain and the park sees no waiter, appends, and nobody ever looks
+again — the unit sleeps over a full queue.
+
+**The series ends routinely, and the reactor re-arms it.** Multishot
+terminates when the provided-buffer ring runs dry with `-ENOBUFS` and when
+a completion overflows the completion ring — both at peak load, not at
+idle. The terminal completion carries an error and no buffer; it is
+appended to the queue as an entry of its own, and the reactor resubmits
+the operation as soon as a buffer is available. A consumer sees a gap in
+the stream, never a silent stall.
+
+**Draining on death.** When a socket closes or its waiting unit ends,
+every queued entry is drained: provided buffers go back to the ring and
+accepted descriptors are closed. A multishot accept yields descriptors
+rather than buffers, so the two cases need different drains and both are
+the socket slot's responsibility.
+
+The queue is bounded by a watermark; above it the reactor stops re-arming
+and lets the kernel's own socket buffers apply backpressure. The number is
+not chosen.
 
 ## Zero-copy
 
-Zero-copy means different mechanisms in each direction and the API says
-which one it is rather than promising the property.
+**Send.** `IORING_OP_SEND_ZC` and `SENDMSG_ZC` post the send result and,
+**only if that result carries `IORING_CQE_F_MORE`**, a second completion
+flagged `IORING_CQE_F_NOTIF` that licenses reuse of the buffer. A send
+that fails posts one completion and no notification ever follows.
 
-**Send.** `IORING_OP_SEND_ZC` and `SENDMSG_ZC` produce **two**
-completions: the send result, flagged `IORING_CQE_F_MORE`, and a
-notification flagged `IORING_CQE_F_NOTIF` that says the buffer may be
-reused. The contract therefore has two events where every other operation
-has one, and the buffer returns to the pool on the second. A caller that
-links a zero-copy send with `IOSQE_IO_LINK` must set `MSG_WAITALL`,
-because a short send is not an error without it and the link would
+The operation's owed-completion count is therefore read from the first
+completion's flags rather than assumed to be two, and the buffer is
+released when the count reaches zero (`design/pool.md`). Assuming two
+strands a buffer on every failed send, and under connection churn the pool
+drains.
+
+A caller that links a zero-copy send with `IOSQE_IO_LINK` must set
+`MSG_WAITALL`: a short send is not an error without it, and the link would
 proceed on partial data.
 
-Zero-copy send is not free at every size: it pins pages and adds a
-completion, and below some payload size the copy is cheaper. The
-threshold is a measurement nobody here has taken, so the API exposes the
-mode and does not choose it.
+Zero-copy send pins pages and adds a completion, so below some payload
+size a copy is cheaper. The threshold is unmeasured, so the API exposes
+the mode and does not choose it.
 
-**Receive.** io_uring zero-copy receive landed in Linux 6.15. It requires
-hardware header-data split, flow steering and a receive queue configured
-for it, so it is an option a deployment enables rather than a path the
-substrate can assume.
+**Receive.** io_uring zero-copy receive arrived in Linux 6.15 and needs
+hardware header-data split, flow steering and a dedicated receive queue.
+Its memory is a registered area refilled through its own ring, with the
+kernel choosing offsets — a fourth ownership shape, not one of the three
+above. It is not exposed until there is a reason to add that shape.
 
-**File to socket.** io_uring has no `sendfile` operation; it has
-`IORING_OP_SPLICE`, available since 5.7. Readiness backends use
-`sendfile(2)`, and Windows uses `TransmitFile`. The API exposes one
-operation over the three.
+**File to socket.** io_uring has no `sendfile`. It has
+`IORING_OP_SPLICE` (5.7), and splice moves data only when one end is a
+pipe, so the io_uring path is file→pipe→socket: a pipe pair per transfer
+and two linked submissions, with the pipe's capacity as a throughput step.
+Readiness backends use `sendfile(2)` and Windows uses `TransmitFile`,
+both of which are one call. The API exposes one operation, and the
+io_uring implementation of it is the expensive one — the opposite of the
+usual ranking, and worth measuring before choosing the path per backend.
+
+## Completions
+
+A completion is matched to its operation slot by `user_data`, which
+carries the operation's handle including its generation, so a completion
+for an operation whose slot was reused cannot be mistaken for the
+successor's (`design/pool.md`).
+
+The reactor then calls `wake(waiter, half, epoch, result)` and does not
+touch the wait record itself. Validation and the result store are steps 1
+and 2 of waking (`design/execution.md`); doing them in the reactor would
+open a window between validating and storing in which the unit could win
+another half and re-park, and the result would land in the wrong wait.
+
+A completion whose operation slot is gone releases what it holds and
+returns.
+
+## Cancellation, in one paragraph
+
+Cancelling an operation is submitting a cancel that names it, waiting for
+what the kernel still owes, and releasing then.
+`IORING_REGISTER_SYNC_CANCEL` is a register call rather than a submitted
+operation and produces no completion, which is why it is used only where
+a thread can afford to block. On the readiness backends an operation
+cancelled before its descriptor signalled was never issued, so the backend
+**synthesizes** a completion for it; without that, the release condition
+never fires and every timed-out read leaks a buffer on macOS, iOS and
+Android. `design/cancellation.md` owns the protocol.
+
+## Kernel feature floors
+
+io_uring is not one capability. A backend that probes only for the ring
+will fail later, feature by feature.
+
+| Feature | Linux |
+|---|---|
+| `IORING_OP_SPLICE` | 5.7 |
+| `IORING_REGISTER_PBUF_RING` (contract 3) | 5.19 |
+| multishot `recv`, `SEND_ZC`, `IORING_REGISTER_SYNC_CANCEL` | 6.0 |
+| `SENDMSG_ZC` | 6.1 |
+| `IOU_PBUF_RING_INC` | 6.12 |
+| zero-copy receive | 6.15 |
+
+The backend probes each at startup and degrades per feature: contract 3
+falls back to contract 1, multishot to repeated single-shot submissions,
+zero-copy send to an ordinary send. A distribution on 5.15 runs with the
+ring and none of the rest, which is a supported configuration rather than
+a failure.
 
 ## Backends
 
 | Backend | Platform | Shape | Contract 3 |
 |---|---|---|---|
-| io_uring | Linux, where permitted | native completion, multishot, registration | native |
-| IOCP | Windows | native completion | emulated: buffer taken at submission |
-| kqueue | macOS, iOS | readiness; syscall issued on signal | native shape: buffer taken at signal |
-| epoll | Linux fallback, Android | readiness; syscall issued on signal | native shape |
+| io_uring | Linux, where permitted and where the feature exists | native completion, multishot, registration | native |
+| IOCP | Windows | native completion | zero-length receive, buffer taken at signal |
+| kqueue | macOS, iOS | readiness; syscall issued on signal | buffer taken at signal |
+| epoll | Linux fallback, Android | readiness; syscall issued on signal | buffer taken at signal |
 
 Regular-file I/O on the readiness backends goes to a thread pool, because
-a file descriptor is always readable and readiness carries no information
-about it. That pool is part of the backend rather than of the scheduler,
-and its size is a deployment parameter.
+readiness carries no information about a file. The pool belongs to the
+backend rather than to the scheduler, and its size is a deployment
+parameter.
 
-Windows has an `IoRing` API on Windows 11 with a submission and
-completion ring resembling io_uring, and a narrower operation set. It is
-not a backend here yet: IOCP covers the platform, and adding a second
-Windows backend before the first is measured would be work with no number
-behind it.
+Windows has an `IoRing` API on Windows 11 with a narrower operation set.
+It is not a backend here: IOCP covers the platform, and a second Windows
+backend before the first is measured would be work with no number behind
+it.
 
-## Submission and completion
+## Errors and short transfers
 
-Submissions are batched: an operation is written into the backend's queue
-and the queue is flushed once per scheduler turn rather than once per
-operation. A unit that submits and parks does not force a flush, because
-its own park is what returns control to the worker, and the worker
-flushes before it waits.
-
-Completions are drained on the worker that owns the backend's queue. For
-each completion the reactor finds the operation slot, validates the
-generation and epoch against the waiting unit, writes the result, and
-calls `wake` (`design/pool.md`, `design/execution.md`). A completion
-whose validation fails is a completion for something that no longer
-exists, and it releases its resources and returns.
-
-## Errors, short transfers, and cancellation
-
-An operation completes with a result that is a byte count or an error;
-the substrate does not retry and does not interpret. A short read is a
-result, not a failure, and the caller decides.
-
-Cancellation is submitted like any other operation
-(`IORING_OP_ASYNC_CANCEL`, or `IORING_REGISTER_SYNC_CANCEL` where an
-inline answer is wanted) and completes like any other. The cancelled
-operation still completes, separately, and its buffer is released on that
-completion rather than on the cancel's. `design/cancellation.md` owns the
-protocol.
+An operation completes with a byte count or an error; the substrate does
+not retry and does not interpret. A short read is a result, not a failure,
+and the caller decides.
 
 ## Decided elsewhere
 
 | Question | Document |
 |---|---|
 | how a unit parks and what `wake` does | `design/execution.md` |
-| where buffers, sockets and operations live | `design/pool.md` |
-| what happens to an operation when its unit is cancelled | `design/cancellation.md` |
+| buffers, sockets, operations, and owed completions | `design/pool.md` |
+| cancelling, and what the kernel still owes | `design/cancellation.md` |
 | what a wait on an operation means to the detector | `design/deadlock.md` |
 
 ## Open questions
 
-- **Which backend a deployment gets, and how it is chosen.** Probing
-  io_uring at startup and falling back to epoll is the obvious answer,
-  but a probe that succeeds under a permissive seccomp profile and fails
-  later under a tightened one gives a running process no path back.
-- **Thread pool sizing for file I/O** on the readiness backends, and
-  whether one pool serves all backends or each owns its own.
+- **Backend choice at startup**, and what a process does when a probe
+  succeeds and a later seccomp tightening makes the ring unusable.
+- **Thread pool sizing** for file I/O, and whether one pool serves all
+  backends.
 - **The zero-copy send threshold**, unmeasured, and whether the substrate
   should pick it at all.
-- **Registration lifetime.** `IORING_REGISTER_BUFFERS` is not free and
-  updating a registration has a cost that varies by kernel; a pool that
-  grows by a slab must re-register or use a sparse registration, and
-  which of the two is cheaper is unmeasured.
-- **Multishot and backpressure.** A multishot receive appends to a
-  socket's queue whether or not anyone is reading it, so a producer
-  faster than its consumer grows that queue. The bound belongs here and
-  is not designed.
+- **Registration lifetime.** Growing a pool by a slab needs a sparse
+  registration and an update call, whose kernel floor and cost are not
+  established (`design/pool.md`).
+- **The multishot queue watermark**, and what backpressure means on the
+  emulating backends, where a level-triggered readiness series never ends
+  on its own.
+- **`splice` versus `sendfile` per backend**, given that the flagship
+  backend has the more expensive path.
