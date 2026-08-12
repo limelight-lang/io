@@ -406,9 +406,12 @@ enqueues the handle. That is a third enqueue, and it is not part of the
 wake invariant: the unit has no wait record yet and no waker can name it.
 
 Completion runs the consumer's unmount hook with reason `Boundary`,
-releases the wait record, and returns the slot. The stack returns to its
-pool only after every operation that named it has confirmed that no kernel
-reference into it remains (`design/cancellation.md`).
+releases the wait record, and returns both the slot and the stack. The
+stack needs no further condition because nothing the kernel may touch
+after submission lives on it: buffers and submission structures come from
+the buffer pool (`design/stacks.md`, `design/reactor.md`). Without that
+rule a late completion would write into a stack already handed to another
+unit, and a stack would have to outlive its owner.
 
 ### Cancellation leaves `Parked` the way a wake does
 

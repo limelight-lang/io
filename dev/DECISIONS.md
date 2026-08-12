@@ -187,3 +187,29 @@ statically; the C ABI rejects it at runtime.
 Cost: two mount paths in the design, not one. Only the stackful path
 installs an actor context, so the stackless path must be readable as a
 restriction of it rather than as a second mechanism.
+
+## 2026-08-12 — Nothing the kernel touches lives on a unit stack
+
+Buffers, `iovec` arrays, `msghdr` structures — everything the kernel may
+read or write after an operation is submitted — come from the buffer pool
+and never from a unit's stack. The submitting API is where this is
+enforced, because it is the only place that can.
+
+Completion-based I/O separates "the call returned" from "the kernel is
+done", and a stack-resident buffer stays exposed for the whole gap.
+Cancelling the unit does not cancel the kernel's claim, and the retired
+loser of an `await` with a timeout is the common case rather than the
+exotic one. Three corruptions follow from allowing it, and none is
+detectable: a late completion writing into a pooled stack now owned by
+another unit; a late completion writing into the *same* unit's live
+frames after it returned past the awaiting frame; and either of those
+arriving after the process has forgotten the operation existed.
+
+What the rule buys is that a stack's lifetime is exactly its unit's.
+Without it, stack management needs a per-stack in-flight count that
+survives unit teardown, an owner for a stack that belongs to no unit and
+no free list, and a policy for a completion that never arrives.
+
+Cost: a consumer cannot read into a local variable. The buffer contracts
+(`design/reactor.md`) are the API that replaces it, and one of the three
+already hands the buffer out from a pool rather than taking one.

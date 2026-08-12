@@ -106,11 +106,32 @@ Done when: S3 and S4 can be written without reopening any question in S2.
         switch, migration, force-killability — so a unit that opts out of
         maintaining it reads as permanently non-zero. CET is ours to
         write: corosensei has no shadow-stack support.
-- [ ] S2.3 `design/stacks.md`
+- [x] S2.3 `design/stacks.md`
       done: the document states the reservation and commit scheme per
         platform, the size classes, the pooling and release protocol, and
         the mapping ceiling with the measured figures
       tier: T2 · role: Critic
+      Critic 2026-08-12 round 1: twenty-two findings, seven high, and one
+        of them removed half the document. The release gate — "a stack
+        returns only after the kernel holds no reference into it" — was
+        unevaluable, because the wait record is overwritten on every park
+        and nothing survived a unit to remember an operation still in
+        flight; worse, the gate protected pool reuse but not the same
+        running unit laying new frames over a retired read's buffer. The
+        answer was to remove the case: nothing the kernel touches lives
+        on a stack, so a stack's lifetime is exactly its unit's. Six more
+        held. Overflow-by-unwinding is not implementable as promised —
+        ARM EHABI has no instruction-precise unwinding, Rust's panic path
+        is not async-signal-safe, and Windows uses SEH — so the default
+        is now process death with a per-platform opt-in. `MEM_RESET` on
+        Windows releases nothing: the commit charge stays, which is a
+        leak on the platform where the table claimed release.
+        `MAP_NORESERVE` is ignored under `vm.overcommit_memory=2`.
+        GCC assumes a 64 KB guard on AArch64, so a one-page band is
+        stepped over by probed code. Every figure was a 4 KB-page figure
+        on targets that run 16 KB pages. Release ordering was
+        unspecified, and one order corrupts. Accepted in full; document
+        rewritten.
 
 ## S3 — Objects and I/O  [ ]
 

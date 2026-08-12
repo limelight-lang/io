@@ -68,8 +68,9 @@ operation must end early.
   reference. `reactor` allocates sockets and timers from them; `deadlock`
   walks them; nobody else may free from them.
 - **Stacks** are owned by `stack` and lent to `unit`. A stack returns to
-  its pool only after `cancel` confirms the kernel holds no reference
-  into it.
+  its pool when its unit completes, which is sound only because nothing
+  the kernel may touch after submission lives on a stack: buffers and
+  submission structures come from the buffer pool instead.
 - **The actor context** is owned by the consumer (Limelight), installed
   by `sched` at mount time, and read by nothing else here.
 
