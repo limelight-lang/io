@@ -22,9 +22,12 @@ order and the step the work continues from.
         limelight-lang/rfc and still needs Edmond's confirmation.
         Deadlock detection is deliberately not a decision: its mechanism
         is open and belongs to S4.1.
-- [ ] S1.2 Public `limelight-lang/io` and the first push
+- [x] S1.2 Public `limelight-lang/io` and the first push
       done: `git ls-remote origin` returns refs
       tier: T1 · role: —
+      handoff: https://github.com/limelight-lang/io, public, main pushed
+        and tracking origin. The reactor is being split out; where the
+        split lands (crate or repository) is not yet settled.
 
 ## S2 — Foundations  [ ]
 

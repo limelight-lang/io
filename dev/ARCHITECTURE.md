@@ -7,6 +7,27 @@ Provisional: the modules below are the ones the design documents are
 being written against (`PLAN.md`). A row hardens when its document
 closes.
 
+## Crates
+
+One repository, one cargo workspace, three crates. The split follows the
+dependency direction, so a consumer that runs computation without I/O
+compiles none of the platform backends.
+
+| Crate | Holds | Depends on |
+|---|---|---|
+| `io-exec` | `unit`, `switch`, `stack`, `sched`, `pool`, `deadlock` | memory manager |
+| `io-reactor` | `reactor` and the four backends, each behind a cargo feature | `io-exec` |
+| `io-api` | the public surface and the C ABI | `io-exec`, `io-reactor` |
+
+`io-reactor` knows `io-exec`; the reverse dependency does not exist and
+must not appear. Cancellation crosses this boundary, so it is split
+rather than shared: `io-exec` cancels a unit through an opaque cancel
+handle stored in the wait record, and whoever parked the unit installed
+that handle. `io-reactor` supplies one that submits the kernel-side
+cancel and waits for its completion.
+
+## Modules
+
 | Module | Responsible for | Knows | Does not know | Depends on |
 |---|---|---|---|---|
 | `unit` | the execution unit and its handle | the two suspension kinds, the discriminant bit, the wait record | which backend completed an operation, what a socket is | `stack` |
@@ -15,7 +36,7 @@ closes.
 | `sched` | mounting units on threads | run queues, stealing, mount and unmount hooks, actor context install | how a unit suspends internally, how an operation completes | `unit`, `switch` |
 | `pool` | object storage and enumeration | the layout of coroutines, sockets and timers; how each pool is walked | the meaning of a wait edge, the reactor backend | memory manager |
 | `reactor` | submitting operations and delivering completions | the four backends, the three buffer contracts, buffer ownership | scheduling policy, the wait-for graph | `pool`, `sched` |
-| `cancel` | cancelling in-flight work | two-phase teardown, what the kernel still owns | why a unit is being cancelled | `reactor`, `pool` |
+| `cancel` | cancelling in-flight work; split across the two crates | unit side: the cancel handle and the teardown order. Operation side: what the kernel still owns and when it lets go | unit side: which backend owns the operation. Operation side: why the unit is being cancelled | `unit`, `reactor` |
 | `deadlock` | finding wait cycles | how parked units are enumerated, AND and OR waits, how a result is validated against a moving system | how an operation is submitted, how a stack is allocated | `pool`, `unit` |
 
 ## Layering

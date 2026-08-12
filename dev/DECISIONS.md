@@ -139,3 +139,28 @@ does not.
 
 Kept from `ext/async`: binding a channel to the scope that created it.
 That one is driven by lifetime rather than by a timeout.
+
+## 2026-08-12 — One repository, three crates
+
+The reactor is separated from the execution substrate as a crate, not as
+a repository. Separation earns its keep: the backends are platform code,
+and a consumer running computation without I/O should not compile them.
+Keeping both in one workspace keeps the wake contract — a completion
+resumes a unit — changeable in one commit, and that contract is
+co-designed with the unit rather than layered on top of it.
+
+Layout: `io-exec` (unit, switch, stack, sched, pool, deadlock),
+`io-reactor` (submission, completion, four backends behind cargo
+features), `io-api` (public surface and the C ABI). Dependencies point
+from `io-api` down to `io-reactor` down to `io-exec`; the reverse edge
+does not exist.
+
+Rejected: `io-rt` as the first crate's name, because it abbreviates
+"runtime" and that word already names two other things in this project;
+`io-api` for the same crate, because it names a shape rather than a
+subject, and because the facade is what actually deserves it.
+
+Cost: the wake contract becomes a published API between crates, so
+changing it means a version bump even inside one repository. That is the
+price of letting a consumer skip the backends, and it falls on the
+boundary we most want stable anyway.
