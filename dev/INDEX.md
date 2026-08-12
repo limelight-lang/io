@@ -15,6 +15,7 @@ No product code yet. The design is being written first, stage by stage
 
 ## Where to look
 
+- **What the project is, and the reading order** → [../README.md](../README.md)
 - **Plan and open steps** → [PLAN.md](PLAN.md)
 - **Architecture / knowledge map** → [ARCHITECTURE.md](ARCHITECTURE.md)
 - **Decisions (what, why, dated)** → [DECISIONS.md](DECISIONS.md)
@@ -46,7 +47,5 @@ Written in the order below; each is listed here once it exists.
 
 ## Not yet present (deferred on purpose)
 
-- `README.md` — written last, because it states the reading order over
-  finished documents (PLAN.md, S4.2).
 - `dev/BENCHMARKS.md` — no code to measure yet.
 - `CHANGELOG.md` — nothing released.
