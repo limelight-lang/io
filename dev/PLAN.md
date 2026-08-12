@@ -77,7 +77,7 @@ Done when: S3 and S4 can be written without reopening any question in S2.
       done: the document states which registers a switch saves in each
         of the two cases, how the live-register mask reaches the switch,
         and how the foreign-frame bit is set and cleared
-      tier: T2 · role: —
+      tier: T2 · role: Critic
 - [ ] S2.3 `design/stacks.md`
       done: the document states the reservation and commit scheme per
         platform, the size classes, the pooling and release protocol, and
