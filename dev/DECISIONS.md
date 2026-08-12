@@ -286,3 +286,82 @@ Deferred reclamation went with it. What survives is the parking protocol
 itself: four states, the order state-record-arm, the seqlock over the wait
 record, and the epoch identifying one wait. Those are about races inside
 one coroutine's life, not about its lifetime.
+
+## 2026-08-12 — A coroutine lives where its memory lives, which splits it in two
+
+Supersedes the entry above that put every coroutine in the GC heap. The
+category follows the memory the coroutine works with, and there are two
+answers because there are two kinds of memory.
+
+**An ordinary coroutine shares its thread's memory**, so it is allocated
+in that thread's heap and never leaves the thread. This is not a
+scheduling policy: its reference counts are non-atomic, and resuming it
+on another thread would have that thread reach into a heap that is not
+its own. It is created on whichever thread creates it, and it dies there.
+
+**An actor shares memory with nobody**, so an actor's coroutine is
+allocated in the actor's arena and travels with it. The actor may be
+mounted on a different thread for a later message, and its arena moves
+with it, so the coroutine object never becomes memory of a thread that no
+longer runs it.
+
+Consequences worth naming, because they constrain everything above:
+
+- **Load cannot be balanced by moving ordinary coroutines.** They are
+  pinned by construction, so a thread that receives a burst of long
+  coroutines keeps them. The unit of load movement is the actor, which is
+  what the concurrency model already says it is.
+- **Work stealing applies to actors only.**
+- **The single `unsafe impl Send` shrinks to the actor path.** An ordinary
+  coroutine never crosses a thread boundary, so the rule against caching
+  a thread-local address across a suspension point, and the pinning that
+  a live foreign frame imposes, are obligations of the actor path alone.
+- **A completion can arrive on a thread that does not own the coroutine**,
+  because each worker has its own ring. It is forwarded to the owner's
+  intake queue, which is the same path a cross-thread cancel already
+  takes (`design/reactor.md`).
+
+## 2026-08-12 — The coroutine object, settled
+
+Agreed with Edmond in conversation, and this entry is the summary the
+architecture map (`dev/ARCHITECTURE.md`) will be written against.
+
+- A coroutine is an **ordinary object**: entity kind 0, with a class the
+  runtime builds. No new entity kind is spent — code 7 is the last one
+  free and stays free. Tracing, teardown and PHP visibility all come from
+  the object machinery unchanged. TrueAsync does the same:
+  `async_coroutine_t` carries a `zend_object` and has a class entry.
+- **The waker is embedded in the coroutine**, as it is in TrueAsync, for
+  the reason its comment gives: no allocation on the parking path. Two
+  wait halves sit inline, which covers the common one-or-two-resource
+  case; the half count is the discriminant, so `count > 2` means the same
+  field holds a pointer to one raw block sized to the count. No separate
+  flag, because a flag can disagree with the count.
+- **The spill block is raw memory, not an entity.** It has exactly one
+  owner and a strictly nested lifetime, so a reference count would buy
+  nothing and cost two atomics per park. It is freed through
+  `deferred_free`, because the collector records the addresses of the
+  cells it holds and re-reads them in a later phase.
+- **Its cells reach the tracer through a `walk` hook** — a new optional
+  field beside `dispose` on the class descriptor, requested of
+  `limelight-lang/model` as its stage S17. The hook yields cells through
+  the reader rather than children, because the collector re-reads a
+  cell's address and raw word; it is called from
+  `object::for_each_counted_cell` after the runs, so tracing, cycle
+  collection and teardown all inherit it from one place; and it is copied
+  into a subclass descriptor the way `dispose` is, or a PHP subclass of
+  `Async\Coroutine` silently loses waker tracing.
+- **The stack and registers are a separate pooled object**, not an
+  entity, exactly as `async_fiber_context_t` is in TrueAsync: stacks are
+  expensive and reusable, coroutines are cheap and numerous.
+- **The Scheduler owns a coroutine's lifetime** and holds a reference to
+  it, which is also what keeps a cycle of blocked coroutines from being
+  collected as garbage before the deadlock detector sees it.
+
+What this retires from the earlier documents in this repository: the
+64-bit handle carrying a slot index and a generation, the bespoke slot
+array, and the deferred reclamation that made a late wake safe. A
+reference count does all three jobs — whoever arms a half holds a
+reference, so the coroutine cannot die underneath it. What survives is
+the parking protocol itself: the four states, the order state-record-arm,
+the seqlock over the wait record, and the epoch identifying one wait.
