@@ -63,7 +63,7 @@ load, so a walker that started before a slab was added does not see it.
 |---|---|---|
 | `state` | one word, atomic | free, or the kind's own live states |
 | `generation` | 32 bits, atomic | incremented once, at allocation |
-| `kind` | 8 bits | which pool this slab belongs to, for assertions |
+| `kind` | 8 bits | which pool this slab belongs to; read for assertions, and by the detector to pick a resource's liveness rule (`design/deadlock.md`) |
 
 The generation is incremented **when a slot is allocated**, not when it is
 released, and it is the only counter that distinguishes occupants. The
@@ -80,7 +80,7 @@ turns out to be thin.
 
 ## Reclamation is deferred, and that is what makes waking safe
 
-A waker validates a handle and then writes: the result into a half's
+A waker validates a handle and then writes: the result into an entry's
 slot, then a counter, then the state word (`design/execution.md`).
 Validating and writing are not one atomic step, so between them the unit
 may complete and its slot may be released.
@@ -94,7 +94,7 @@ What this buys: a late waker writes into a slot that is free but not yet
 reused, which harms nothing, and then fails its final compare-and-swap on
 the state word because the state is free. A slot handed out immediately
 would instead take those writes into a live occupant's record — a result
-in a half that never fired, a decremented counter, a unit woken out of a
+in an entry that never fired, a decremented counter, a unit woken out of a
 wait nothing satisfied.
 
 The generation is what rejects a wake that arrives *after* reuse; the
@@ -168,7 +168,7 @@ own stack (`design/switching.md`), so the slot's size does not follow the
 platform's register file.
 
 Two wait entries cover an operation and a timer, which is `await` with a
-timeout. A wait with more halves takes a spill slot from the same pool
+timeout. A wait with more entries takes a spill slot from the same pool
 and stores its handle in place of the entries. A spill slot's state marks
 it as a spill so a walker skips it as a unit, and it is freed under the
 same deferred reclamation as any slot, so a walker mid-read is safe.
@@ -197,7 +197,7 @@ false negative by construction and it is the safe direction.
 | Group | Contents |
 |---|---|
 | header | `state`: submitted, result received, awaiting notification, cancelling |
-| target | the waiter's handle, the half index, the epoch to validate |
+| target | the waiter's handle, the entry index, the epoch to validate |
 | memory | the buffer handle it pins, and the buffer's registered index if it has one |
 | accounting | how many completions the kernel still owes |
 
@@ -217,25 +217,44 @@ reaches zero and not before.
 
 ### Resource
 
-Anything a unit can wait on has a slot, and every such slot answers one
-question: who owes this wait right now.
+A resource a unit can wait on answers who can end that wait, and there are
+three kinds of answer (`design/deadlock.md`).
+
+**An external resource is ended without any unit** — an operation by the
+kernel, a timer by the wheel — so it holds no owner field and closes no
+cycle.
+
+**A debtor resource names its owner in a field:**
 
 | Resource | Owner field |
 |---|---|
-| mutex, semaphore | the unit holding it |
-| actor | the unit processing its current message, or none |
-| channel | its registered senders, or its registered receivers |
-| operation | the kernel |
-| timer | the wheel |
+| mutex | the unit holding it |
+| semaphore, guard-released | its permit holders and its free count |
+| actor, for a synchronous call | the unit processing its current message, or none |
+| join | the unit being waited for |
+
+The semaphore is a debtor only while its permits are released by dropping a
+guard, which is what ties a release to an acquisition. One that anyone may
+post without acquiring first — every semaphore reached over the C ABI —
+belongs with the channels below (`design/deadlock.md`).
 
 A wait record names the resource; the resource names its owner, read fresh
 by whoever asks. That indirection is what keeps an edge true when a mutex
-changes hands and the previous holder's slot is reused
-(`design/deadlock.md`).
+changes hands and the previous holder's slot is reused.
 
-A consumer that builds a mutex or a channel of its own over the C ABI
-takes on keeping its owner field truthful. Nothing checks it, and the
-detector's promise never to invent a deadlock rests on it.
+**A channel and a future name nobody.** Whoever holds the write end may
+serve the wait, so no owner field can be right, and a registry of senders
+would answer a question nobody asks: the detector needs who can still
+reach the write end, which is reachability and not a field. What such a
+resource does carry is its own state — buffer occupancy, the closed or
+broken flag — and the rule that dropping the last write end closes it.
+
+A consumer that builds a resource of its own over the C ABI takes on the
+contract of its kind: a mutex keeps its owner field truthful, a channel
+holds its write ends in the registered handle table, and a semaphore either
+declares guard discipline and a truthful holder list or is treated as
+postable and therefore always live. Nothing checks any of it, and the
+detector's promise never to invent a deadlock rests on all three.
 
 ### Buffer, socket, timer
 
@@ -243,7 +262,7 @@ A buffer slot is a header, a length, the registered index if the pool is
 registered, and the payload. A socket slot is a header, the descriptor or
 its registered index, and the head and tail of the queue a multishot
 operation appends to (`design/reactor.md`). A timer slot is a header, a
-deadline, and the waiter's handle with its half and epoch. None of them
+deadline, and the waiter's handle with its entry and epoch. None of them
 carries a wait record: only units wait.
 
 ## Allocation and release

@@ -457,3 +457,200 @@ Open:
   answer. `ll-model` has a threaded driver today (`run_epoch`) and a
   steppable collector beside it, so both remain open. Raised by Edmond
   2026-08-12 and explicitly left to think about.
+
+## 2026-08-12 — The collector runs on its own thread
+
+Decided by Edmond, closing the last open item of the entry above. The
+collector has a thread of its own and watches the mutators, so it reads
+every thread's entities in one pass and a cycle spanning threads is
+visible without assembling partial answers. The rejected alternative —
+running on a mutator's thread — sees that thread's memory only, which
+brings back the combining step and its stall on a thread that does not
+answer, and the detector cannot afford that stall because the thread that
+does not answer is the one it is looking for.
+
+## 2026-08-12 — `half` is renamed `entry`
+
+A wait record holds one **entry** per thing a coroutine waits on: the
+resource handle, a cancel handle, a result slot, a fired bit. The kind of
+the resource is read from the resource, never copied into the entry.
+The earlier name was `half`, from "half an edge", and it was wrong in two
+ways: an edge has exactly two halves while a record has as many entries as
+the coroutine waits on things, and the record's own field table already
+called them entries. `wake(unit, half, epoch, result)` becomes
+`wake(unit, entry, epoch, result)`.
+
+The word survives where it is true. A wait edge has two ends: the
+coroutine's end names a resource, and the resource's end answers who can
+end the wait — a debtor by naming it, a channel or a future by who can
+still reach its write end. Neither end is a record field.
+
+## 2026-08-12 — The detector: a liveness fixpoint over one collector walk
+
+Supersedes the trigger, the search and the victim rules of
+`design/deadlock.md`, which described a per-worker search from a suspect
+under a seqlock. The mechanism below is what that document now carries;
+this entry records what was chosen and why.
+
+**Resources split three ways, and the kind decides the rule.**
+
+- *External* — a kernel operation, an armed timer. Served without any
+  coroutine, so such an entry is always live.
+- *Debtor* — a mutex, a synchronous actor call, a join on a coroutine, and
+  a semaphore whose permits are released only by dropping a guard. The
+  resource names who owes it, read fresh at evaluation.
+- *Supply* — a channel, a future, an actor mailbox, and a semaphore anyone
+  may post without acquiring first. No owner field can exist, because
+  whoever holds the write end may serve the wait. Liveness is reachability
+  of the write end.
+
+The semaphore is split by its API rather than by its name, and the split is
+not cosmetic: a semaphore created with zero permits and posted by a
+producer that never acquired anything has no holders, so calling it a
+debtor would report its waiter deadlocked while the producer runs. Release
+tied to acquisition is what makes a holder a debtor, and only a guard
+enforces that tie. Everything reached over the C ABI counts as postable,
+because its discipline is not ours to see.
+
+The third kind is what the earlier document missed, and Edmond raised it:
+a future is a memory cell that someone may write. A coroutine awaiting one
+that nobody will resolve waits forever while belonging to no cycle, so a
+cycle search cannot see it. Reachability can, and the detector reads
+reachability anyway because it runs inside the collector's walk.
+
+**Detection is a least fixpoint over the whole heap, not a search from a
+suspect.** Seed the live set with what proceeds unaided: every coroutine
+that is not parked, every parked coroutine whose wait is already decided,
+every entry the kernel or the timer wheel will end. Then grow: a debtor
+entry is live when its debtor is live, a supply entry is live when the
+resource can serve it now or its write end is reachable from something
+already live; a coroutine in OR mode is live when any outstanding entry is
+live, in AND mode when all are. Iterate until the live set stops growing.
+Whatever remains parked and unmarked can never proceed.
+
+Growing from the live set is the direction that works. Starting from "all
+live" and removing lets a cycle count itself as its own support, so it is
+never removed.
+
+**Liveness is per entry, never per coroutine.** An earlier form of this
+rule marked a whole coroutine live because one of its entries waited on
+the kernel, and that loses a real deadlock permanently: B waits on AND
+[kernel operation, mutex N held by A] while A waits on mutex M held by B.
+The kernel answers and B still never proceeds, because N arrives only from
+A and A waits on B. Under the per-coroutine rule B is live, liveness
+reaches A through N, and the pair is never reported.
+
+The same correction fixes the arming rule of `design/deadlock.md`, which
+armed no watchdog for a wait with any kernel entry. Call an entry
+cycle-capable when it names a mutex, semaphore, channel, actor, future or
+join. An OR
+wait arms a watchdog when every entry is cycle-capable, since one kernel or
+timer entry satisfies an OR forever; an AND wait arms one when at least one
+entry is cycle-capable, whatever else it names. Both parts of that rule
+are load-bearing: without the second, a cycle through a mutex held beside a
+kernel wait arms nothing; without the first, three coroutines in OR over
+each other's mutexes form a knot that arms nothing. The cost promise
+survives: a socket read is a single kernel wait or an OR wait with a
+timeout, so a hundred thousand idle connections still arm nothing.
+
+**Two marks are propagated by one walk.** The memory mark keeps its roots,
+including the scheduler's ownership table, the timer wheel and the reactor
+intake queues. The liveness mark takes different roots — globals, the C-ABI
+handle table, unparked coroutines, decided waits, coroutines named by a
+pending intake entry — and does not flow out of a parked coroutine that is
+not itself marked live. Rooting liveness in the scheduler's table would
+mark every parked coroutine reachable and blind the detector permanently.
+
+Beside the two marks the pass collects a **served set**: a resource that a
+pending intake entry would move so a wait on it can proceed, a deposit and
+a take alike. It is a set and not a mark, because it says that this
+resource can serve a wait now, which is not what reachability of a resource
+would say. Without it, a cross-thread send whose sender has already
+finished is recorded nowhere the pass reads, and its receiver is reported
+dead. It obliges the worker to hold one intake queue
+drained in order, so a deposit recorded during a pass is applied before the
+resolution that pass produced; `design/reactor.md` owes that contract.
+
+**The trigger is the wait-age watchdog, with quiescence as an
+accelerator.** A watchdog expiry requests a collector epoch rather than
+running a search itself. The last worker about to sleep requests one too,
+which detects a total freeze at the moment it forms instead of a threshold
+later; that is what Go's `checkdead` gets right, and its limitation is
+that it has nothing else, so a cycle among three goroutines inside a busy
+program is never found. Quiescence stays an accelerator here and never a
+criterion, which the entry of 2026-08-12 above already required. Threshold:
+1 s in PostgreSQL's spirit, doubled on each re-arm of the same wait epoch
+so a long healthy mutex hold costs a thinning series of passes. The figure
+is not measured and stays a deployment parameter.
+
+**Deadlock resolves softly: the waiter resumes with an exception.**
+Requested by Edmond. A proved-unresolvable wait fails at its wait point
+and the process keeps running. A channel receive fails exactly as a
+receive on a closed channel fails, and a future await exactly as a broken
+promise fails, so code already correct against closure needs no change;
+the error value carries the cause and the report handle. Mutex, actor call
+and join have no closure to imitate and raise a deadlock error of their
+own.
+
+**The detector marks no resource.** A resource dies by its own rule:
+dropping the last write end closes a channel and breaks a future, and that
+wakes every waiter through the ordinary path. The consequence Edmond asked
+for arrives anyway, because the resumed coroutine drops the last write end
+while unwinding, which closes the channel and fails its co-waiters at once
+without a second collector pass. A mark placed by the detector would be
+wrong in the case that matters: while a write end is still held by
+coroutines of the dead set, resolving one of them may resurrect a
+legitimate writer, and the mark would turn its legitimate write into an
+error the detector itself invented.
+
+**One coroutine per sink strongly-connected component is resolved per
+pass.** Resolving one invalidates every deadness proof that depended on it,
+and a sink's proofs depend only on its own members and on facts grounded
+outside the set, so a sink is the largest batch that stays sound. A cycle
+is a sink of two or more; a coroutine starved by an unreachable write end
+is a sink of one. Bystanders hang above the sinks and are never chosen,
+which the earlier document already required.
+
+**The collector never writes into a coroutine.** It posts a conditional
+resolution to the owner's reactor, and the owner acts only if state, wait
+epoch, winner and fired bits still equal what was recorded. Every input to
+deadness except the fired bits and the winner is written once per epoch,
+and those two only grow within one, so equality proves the snapshot
+described this exact wait. This is what makes a false kill require a
+broken contract rather than a lost race, and it is why parking can stay
+plain stores: a second writer would recreate the cross-thread race the
+single-thread invariant removed.
+
+**Policy is the consumer's, process-wide:** soft by default; hard, which
+publishes the report and aborts, for tests and CI where a deadlock must be
+loud; report-only, which publishes and resolves nothing, for observation
+in production.
+
+**The design errs toward missed detection, and soft resolution does not
+move that.** A false positive is a semantic lie rather than a survivable
+hiccup: one receiver observes a closed channel while another reads data
+from the same healthy channel, and no catch block repairs that. The
+validation costs nothing measurable per pass, so relaxing it would buy no
+speed either, and latency is set by the threshold instead.
+
+What this retires: the seqlock over the wait record, the claim word and
+the two-search race it settled, the per-worker search from a suspect, and
+the rule that any kernel entry disarms the watchdog. What it adds as an
+obligation elsewhere: closing on the drop of the last write end is channel
+and future semantics, and no document owns it yet.
+
+Open:
+
+- **Integration with the `ll-model` walk is asserted, not verified.** The
+  detector needs a second mark with different flow through parked
+  coroutines, a re-visit of a coroutine that turns live mid-fixpoint, and
+  multi-word snapshots read across threads — of a wait record, and of a
+  resource's own fields such as a mutex holder or a channel's occupancy and
+  closed flag — under a re-read discipline built for single counted cells.
+  Whether `run_epoch` and the steppable collector host all three is
+  unchecked against their code. The fallback, if they
+  cannot, is a detector-owned second traversal of parked coroutines inside
+  the same pass, which changes the cost and not the protocol.
+- **A live holder that never writes** is undetectable by construction:
+  reachability proves possibility, not intent. The diagnostic dump over
+  the pools is the tool for that case.

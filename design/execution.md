@@ -51,7 +51,7 @@ a foreign frame has nowhere to return `Pending` to.
 ## One handle, two kinds
 
 The scheduler queues one thing: a counted reference to a unit. Whoever
-arms a half of a wait holds one too, so the unit cannot be freed
+arms an entry of a wait holds one too, so the unit cannot be freed
 underneath a wake that is still on its way. The suspension kind is a
 field of the unit, which dispatch reads anyway.
 
@@ -107,13 +107,13 @@ Every other difference from a stackful resume follows from that.
 `waker` is one function, callable from any thread:
 
 ```
-wake(unit, half: u32, epoch: u64, result: Result)
+wake(unit, entry: u32, epoch: u64, result: Result)
 ```
 
 The unit passes it to whatever will end the wait, together with a counted
 reference to itself, which is what keeps it alive until the call arrives.
-`half` names which entry of the wait record is being ended, `epoch` is
-the value the record carried when that half was armed, and `result` is
+`entry` is the index of the wait-record entry being ended, `epoch` is
+the value the record carried when that entry was armed, and `result` is
 what the unit reads after it resumes. The algorithm is in "Waking", and
 it is the same call the reactor makes on a completion
 (`design/reactor.md`).
@@ -137,8 +137,8 @@ stores and the wake that could once arrive mid-suspension cannot.
 
 1. **Write the record.** A fresh `epoch`, the entries, the mode, and
    `remaining` for an AND wait.
-2. **Arm each half.** Submit the operation, send the message, arm the
-   timer — each carrying the unit, its half index, and the epoch from
+2. **Arm each entry.** Submit the operation, send the message, arm the
+   timer — each carrying the unit, its entry index, and the epoch from
    step 1. Arming after the record is written is what guarantees a
    completion finds somewhere to record itself.
 3. **Suspend.** A stackful unit switches to the worker. A stackless unit
@@ -149,7 +149,7 @@ stores and the wake that could once arrive mid-suspension cannot.
    context was still being saved would be resumable before it was
    savable, which is a bug even on one thread.
 
-If a half completed inline during step 2 — the reactor's submission
+If an entry completed inline during step 2 — the reactor's submission
 returned a result at once, the mailbox already held the reply — the unit
 does not suspend at all: step 3 is skipped and it continues.
 
@@ -192,26 +192,26 @@ with it.
 
 ## Waking
 
-`wake(unit, half, epoch, result)` runs on the unit's own thread — the
+`wake(unit, entry, epoch, result)` runs on the unit's own thread — the
 reactor drains its worker's completions there, a mailbox is read by its
 actor's thread, and a signal from elsewhere reaches the reactor rather
 than the unit. It does five things in order.
 
 1. **Validate the epoch.** Compare the record's epoch with the argument.
-   A mismatch means this half was retired and the unit has since parked
+   A mismatch means this entry was retired and the unit has since parked
    on something else, so the call returns. Without it a loser of a
    previous OR wait, firing between the win and the retirement, would
-   wake the unit out of an unrelated wait with no half fired at all.
+   wake the unit out of an unrelated wait with no entry fired at all.
 
-   The unit itself cannot be gone: whoever armed the half holds a
+   The unit itself cannot be gone: whoever armed the entry holds a
    counted reference to it, so it is alive for as long as the wake can
    arrive.
-2. **Store the result** into the half's entry.
+2. **Store the result** into that entry.
 3. **Decide whether the wait is over.** Under **OR**, claim the winner
    field; a caller that finds it claimed returns. Under **AND**,
    decrement `remaining`; a caller that does not take it to zero returns.
-4. **Retire the other halves** through their cancel handles. Retirement
-   is asynchronous, so a retired half may still fire; the epoch check in
+4. **Retire the other entries** through their cancel handles. Retirement
+   is asynchronous, so a retired entry may still fire; the epoch check in
    step 1 is what makes that harmless.
 5. **Move the state word** from `Parked` to `Woken` and enqueue.
 
@@ -221,44 +221,51 @@ makes them arrive exactly once.
 ## The wait record
 
 The wait record states what the unit is waiting for and who will end the
-wait. It carries one entry per half:
+wait. It carries one entry per thing the unit waits on:
 
 | Field | Meaning |
 |---|---|
 | resource | the handle of what is being waited on: a mutex, a channel, an actor, an operation, a timer |
-| cancel | an opaque handle that ends this half early |
+| cancel | an opaque handle that ends this entry early |
 | result | where the waker stores what the unit will read |
-| fired | whether this half has already been satisfied |
+| fired | whether this entry has already been satisfied |
 
-**The record names a resource, not the unit that will end the wait.** Who
-owes the wait is a field of the resource's own slot, read fresh when
-anyone asks (`design/pool.md`). Naming a unit directly goes stale the
+**The record names a resource, not the unit that will end the wait.** What
+the resource answers depends on its kind: a mutex or an actor names one
+owner in a field, read fresh when anyone asks (`design/pool.md`), while a
+channel or a future names nobody and is answered by reachability
+(`design/deadlock.md`). Naming a unit directly goes stale the
 moment a resource changes hands: two units parked on one mutex both record
 its holder, the holder releases it and finishes, its slot is reused, and
 the second waiter's record now names a stranger.
 
 and, once per record: the mode, `remaining` for AND, the winner field for
-OR, and the `epoch` that every armed half carries.
+OR, and the `epoch` that every armed entry carries.
 
-**A resource says who owes it.** A mutex names its holder, an actor names
-the unit processing its current message, an operation names the kernel, a
-channel names its registered senders. `design/deadlock.md` reads those
-fields; nothing here does.
+**Who can end a wait is answered by the resource, and how it answers
+depends on its kind** (`design/deadlock.md`). A mutex names its holder, an
+actor names the unit processing its current message, a join names its
+target, an operation names the kernel: one debtor, in a field. A channel
+and a future name nobody, because whoever holds the write end may serve
+the wait, and the answer for them is which holders of that write end still
+exist. `design/deadlock.md` reads all of this; nothing here does.
 
 **The mode:**
 
-- **AND** — the unit continues when every half has fired. `remaining`
-  starts at the number of halves.
-- **OR** — the unit continues when any half has fired, and the winner
+- **AND** — the unit continues when every entry has fired. `remaining`
+  starts at the number of entries.
+- **OR** — the unit continues when any entry has fired, and the winner
   retires the others.
 
 `await` with a timeout is the ordinary OR: a timer and an operation.
 
-Recording what a unit waits on, without anything saying who owes it, gives
-half an edge, and half an edge cannot close a cycle. `php-src/ext/async`
-records exactly that half (`dev/DECISIONS.md`, 2026-08-12). Here the other
-half lives in the resource, which is what keeps it true as ownership
-moves.
+A wait edge has two ends. Recording what a unit waits on gives one of them,
+and one end cannot close a cycle. `php-src/ext/async` records exactly that
+end and nothing else (`dev/DECISIONS.md`, 2026-08-12). Here the second end
+is answered by the resource, which is what keeps it true as ownership
+moves. Neither end is a record field: an entry names the resource, and the
+resource answers who can end the wait — a debtor by naming it, a channel
+or a future by who can still reach its write end (`design/deadlock.md`).
 
 **Writers and readers.** The record is written and read by the unit's own
 thread and by nothing else: the unit writes it while `Running`, and
@@ -402,42 +409,53 @@ That is the whole reason the stackful kind is the default.
 ## Lifecycle
 
 ```
-create ──▶ queued ──▶ Running ──┬──▶ Parking ──┬──▶ Parked ──▶ Woken ──┐
-                        ▲       │              │                       │
-                        │       │              └──▶ Woken ─────────────┤
-                        │       │                                      │
-                        │       └──▶ complete ──▶ teardown ──▶ released │
-                        │                                              │
-                        └──────────────────────────────────────────────┘
+                         ┌────────────────────────┐
+                         ▼                        │
+create ──▶ queued ──▶ Running ──┬──▶ Parked ──▶ Woken
+                                │
+                                └──▶ complete ──▶ teardown ──▶ released
 ```
 
-`Parking → Woken` is the wake that arrived during the suspension; the
-worker enqueues on its failed swap. `Parked → Woken` is the ordinary
-wake, enqueued by the waker. Both re-enter `Running` through the run
+`Woken` returns to `Running` through the run queue; `released` is
+terminal.
+
+There are three states and no fourth. A wake that arrives while the unit
+is still suspending does not exist, because only the unit's own thread
+touches it: the wake is delivered to that thread's reactor and applied
+after the unit is `Parked` (`dev/DECISIONS.md`, 2026-08-12). `Parked →
+Woken` is enqueued by the waker, re-enters `Running` through the run
 queue, and teardown is reached only from `Running`.
 
-Creation takes a slot from the unit pool (`design/pool.md`) and, for a
-stackful unit, a stack from the stack pool (`design/stacks.md`), then
-enqueues the handle. That is a third enqueue, and it is not part of the
-wake invariant: the unit has no wait record yet and no waker can name it.
+Creation allocates the coroutine object, which is an ordinary refcounted
+entity of the memory manager, and for a stackful unit takes a stack from
+the stack pool (`design/stacks.md`), then enqueues it. That is a third
+enqueue, and it is not part of the wake invariant: the unit has no wait
+record yet and no waker can name it.
 
 Completion runs the consumer's unmount hook with reason `Boundary`,
-releases the wait record, and returns both the slot and the stack. The
-stack needs no further condition because nothing the kernel may touch
-after submission lives on it: buffers and submission structures come from
-the buffer pool (`design/stacks.md`, `design/reactor.md`). Without that
-rule a late completion would write into a stack already handed to another
-unit, and a stack would have to outlive its owner.
+releases the wait record, returns the stack, and drops the scheduler's
+reference; the object is freed when the last reference goes. The stack
+needs no further condition because nothing the kernel may touch after
+submission lives on it: buffers and submission structures come from the
+buffer pool (`design/stacks.md`, `design/reactor.md`). Without that rule a
+late completion would write into a stack already handed to another unit,
+and a stack would have to outlive its owner.
 
-### Cancellation moves the state word, not a half
+### Cancellation moves the state word, not an entry
 
-Cancelling a parked unit sets a cancelled bit in the state word with the
-same compare-and-swap the parking protocol uses, and the winner bumps the
-epoch so every armed half goes stale
-(`design/cancellation.md`). It does not go through `wake`'s half index and
+Cancelling a parked unit runs on the unit's own thread, the thread that
+parked it, and a cancel raised elsewhere is posted to that thread's
+reactor. On that thread the order is the wake protocol's, because a
+cancellation is a wake carrying an error and an implementation has one code
+path for both: store the cancellation as the result; decide the wait, which
+here means setting the cancelled bit and bumping the epoch so every armed
+entry goes stale; retire the entries through their cancel handles; store
+`Woken` and enqueue (`design/cancellation.md`). Every store is plain, and
+the state store is last for the same reason it is last in a wake. It does
+not go through `wake`'s entry index and
 counter, because an AND wait's counter would swallow it: a waker that does
 not take `remaining` to zero returns without waking, and a cancelled unit
-would sleep forever waiting for halves that were just retired.
+would sleep forever waiting for entries that were just retired.
 
 The bit is a modifier on the transitions that already exist, not a state
 of its own. It is set by the unit's own thread, because a cancel raised
@@ -469,10 +487,10 @@ and the correction is listed in `dev/INDEX.md`.
 |---|---|
 | what a context switch saves, and when it may save less | `design/switching.md` |
 | stack reservation, commit, size classes, pooling | `design/stacks.md` |
-| the unit slot layout, its alignment, and how pools are walked | `design/pool.md` |
+| slot layout for pooled resources, and how pools are walked | `design/pool.md` |
 | submitting operations, delivering completions, calling `wake` | `design/reactor.md` |
-| retiring a half, and releasing what the kernel holds | `design/cancellation.md` |
-| finding wait cycles, and the victim policy | `design/deadlock.md` |
+| retiring an entry, and releasing what the kernel holds | `design/cancellation.md` |
+| proving a wait dead, and what is failed when it is | `design/deadlock.md` |
 
 ## Open questions
 

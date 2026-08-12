@@ -193,11 +193,11 @@ carries the operation's handle including its generation, so a completion
 for an operation whose slot was reused cannot be mistaken for the
 successor's (`design/pool.md`).
 
-The reactor then calls `wake(waiter, half, epoch, result)` and does not
+The reactor then calls `wake(waiter, entry, epoch, result)` and does not
 touch the wait record itself. Validation and the result store are steps 1
 and 2 of waking (`design/execution.md`); doing them in the reactor would
 open a window between validating and storing in which the unit could win
-another half and re-park, and the result would land in the wrong wait.
+another entry and re-park, and the result would land in the wrong wait.
 
 A completion whose operation slot is gone releases what it holds and
 returns.

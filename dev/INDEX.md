@@ -34,10 +34,27 @@ and `dev/DECISIONS.md` of that date is what holds where they disagree:
 | a 64-bit handle carrying a pool slot and a generation | a counted reference to the coroutine object | `design/pool.md` |
 | slots in a bespoke array, with deferred reclamation | the coroutine is an entity in the memory manager; pools remain for sockets, timers, operations and buffers | `design/pool.md` |
 | a compare-and-swap on every parking transition, and the `Parking` state | plain stores: a unit is touched only by its own thread | `design/cancellation.md` |
-| a seqlock over the wait record, and generation checks on the wake path | the epoch alone, for telling this wait from the previous one | `design/deadlock.md`, `README.md` |
+| a seqlock over the wait record, and generation checks on the wake path | the epoch alone, for telling this wait from the previous one | `design/pool.md`, `README.md` |
+| the detector's claim word, and a search rooted at one suspect | one detector on the collector's thread, one fixpoint over the whole heap | `design/pool.md` |
+| a `poster` field in the wait record, and occupant validation on the wake path | the entry names a resource; the resource answers who can end the wait | `design/pool.md` |
 
-`design/execution.md`, `design/switching.md` and `design/stacks.md` are
-already corrected. Applying the rest belongs to the architecture stage.
+`design/execution.md`, `design/switching.md`, `design/stacks.md` and
+`design/deadlock.md` are already corrected. Applying the rest belongs to
+the architecture stage.
+
+One question has to be settled while applying them, because three
+documents give two answers: **when the wait epoch moves.**
+`design/cancellation.md` bumps it when a wait ends, `design/pool.md` moves
+it only at the next park, and the wake protocol in `design/execution.md`
+has no bump step at all. The detector's confirmation on the owner thread
+(`design/deadlock.md`, step 12) compares the epoch, so the answer is an
+input to its correctness and not a detail of wording.
+
+**`half` is renamed `entry`** (`dev/DECISIONS.md`, 2026-08-12): one entry
+of the wait record per thing a coroutine waits on. Renamed in
+`design/execution.md`, `cancellation.md`, `pool.md`, `reactor.md` and
+`deadlock.md`. `README.md` still says half. Earlier `DECISIONS.md` entries
+keep the old word, because an entry there is superseded and never edited.
 
 ## Design documents
 
@@ -48,10 +65,10 @@ Written in the order below; each is listed here once it exists.
 | `design/execution.md` | what an execution unit is, how the two coroutine kinds share one handle, how a unit is mounted on a thread |
 | `design/switching.md` | narrow and full context switches, the live-register mask, the foreign-frame bit |
 | `design/stacks.md` | reservation, lazy commit, pooling, size classes, the mapping ceiling |
-| `design/pool.md` | object layout for coroutines, sockets and timers; how the pools are walked |
+| `design/pool.md` | slot layout for sockets, timers, operations and buffers; how the pools are walked; what a resource answers about a wait |
 | `design/reactor.md` | the completion-first API, the three buffer contracts, the four backends |
 | `design/cancellation.md` | cancellation and two-phase teardown while the kernel still owns a buffer |
-| `design/deadlock.md` | how a wait cycle is found, AND and OR waits, victim selection |
+| `design/deadlock.md` | the liveness fixpoint inside the collector's walk, the three resource kinds, soft resolution by exception |
 
 ## Related repositories
 
@@ -65,3 +82,10 @@ Written in the order below; each is listed here once it exists.
 
 - `dev/BENCHMARKS.md` — no code to measure yet.
 - `CHANGELOG.md` — nothing released.
+- A document for channels and futures. `design/deadlock.md` depends on
+  their semantics — dropping the last write end closes a channel and
+  breaks a future, and no traced reference runs from the resource back to
+  its ends — and nothing defines them.
+- The ordering contract of the reactor's intake queue. `design/reactor.md`
+  describes the queue without it, and `design/deadlock.md` rests on one
+  queue per worker drained in order.

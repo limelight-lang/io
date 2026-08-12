@@ -14,7 +14,7 @@ cleanup is not ours to run (`design/execution.md`).
 
 ## Cancelling a unit is a wake
 
-A cancel is delivered through the state word, not through a half. This is
+A cancel is delivered through the state word, not through an entry. This is
 the whole of the fix for two failures the first version of this document
 had: a cancelled unit parked on an AND wait never resumed, because the
 ordinary wake path decrements `remaining` and returns without waking
@@ -37,8 +37,8 @@ The transition is one atomic operation on one word, so there is no window
 between validating the occupant and marking it, and no epoch to race
 against.
 
-**Whoever wins the transition bumps the epoch and retires the halves.**
-Bumping the epoch is what makes every armed half stale, so no other waker
+**Whoever wins the transition bumps the epoch and retires the entries.**
+Bumping the epoch is what makes every armed entry stale, so no other waker
 can also claim the wait: the cancel is the winner regardless of mode, and
 an AND wait's counter is never consulted. Retirement happens once,
 performed by the winner, so cancel handles are called exactly once and
@@ -83,10 +83,10 @@ unit, which is deliberate — a `catch` block in PHP that handles the
 cancellation exception is entitled to continue. A supervisor that means
 otherwise escalates to final.
 
-## Retiring a half
+## Retiring an entry
 
 Every entry in a wait record carries an opaque cancel handle, installed by
-whoever armed that half. Retiring is calling it, and what it does depends
+whoever armed that entry. Retiring is calling it, and what it does depends
 on what armed it:
 
 - **A timer** is removed from the wheel. Synchronous.
@@ -94,7 +94,7 @@ on what armed it:
   arrival. There is nothing to recall.
 - **A kernel operation** is two phases, below.
 
-**Retirement is asynchronous and a retired half may still fire.** What
+**Retirement is asynchronous and a retired entry may still fire.** What
 makes that harmless is the epoch bump performed by whoever ended the wait:
 a late completion validates against the record's current epoch, finds it
 moved, and returns (`design/execution.md`). The epoch moves at the moment
@@ -137,8 +137,8 @@ the buffer does not release anything at all.
 Only the worker that owns a submission queue may write to it
 (`design/reactor.md`), and retirement runs on whichever thread ended the
 wait. A cancel from another thread is posted to the owning worker's intake
-queue and submitted on its next turn, so the latency between retiring a
-half and the kernel seeing the cancel is bounded by one scheduler turn of
+queue and submitted on its next turn, so the latency between retiring an
+entry and the kernel seeing the cancel is bounded by one scheduler turn of
 that worker rather than by nothing.
 
 `IORING_REGISTER_SYNC_CANCEL` answers inline and therefore blocks the
@@ -178,7 +178,7 @@ waits for.
 
 A timeout is not a cancellation mechanism; it is an OR wait with a timer
 in it (`design/execution.md`). The timer firing ends the wait with a
-timeout result and retires the other halves like any winner.
+timeout result and retires the other entries like any winner.
 
 The distinction is what keeps timeouts free of their own machinery: no
 timeout state, no per-operation timeout list, no second path through the

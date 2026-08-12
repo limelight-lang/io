@@ -116,7 +116,7 @@ code path is a measurement, listed below, and it has not been taken.
 ### The park primitive must be on that path
 
 Parking runs through substrate code — the state store, the record write,
-the arming of each half (`design/execution.md`) — and that code is
+the arming of each entry (`design/execution.md`) — and that code is
 compiled by rustc under the ordinary convention. Its frames hold
 callee-saved values like any others, so a switch reached through them
 cannot narrow.
