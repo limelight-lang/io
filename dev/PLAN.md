@@ -82,7 +82,7 @@ Done when: S3 and S4 can be written without reopening any question in S2.
       done: the document states the reservation and commit scheme per
         platform, the size classes, the pooling and release protocol, and
         the mapping ceiling with the measured figures
-      tier: T2 · role: —
+      tier: T2 · role: Critic
 
 ## S3 — Objects and I/O  [ ]
 
