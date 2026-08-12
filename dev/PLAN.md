@@ -78,6 +78,27 @@ Done when: S3 and S4 can be written without reopening any question in S2.
         of the two cases, how the live-register mask reaches the switch,
         and how the foreign-frame bit is set and cleared
       tier: T2 · role: Critic
+      Critic 2026-08-12 round 1: the narrow switch was unsound as
+        designed. A per-site live-register mask cannot see the frames
+        above it, so a callee-saved register holding an ancestor's value
+        goes unsaved and another unit overwrites it — silent corruption,
+        no crash. Correcting the mask to "live, plus every callee-saved
+        register this frame did not spill" restores nearly the full set
+        and erases the gain, so the mask was dropped: narrowing is now a
+        calling convention with no callee-saved registers along
+        suspendable paths, and the park primitive's tail is assembly
+        because a rustc-compiled frame between the site and the switch
+        would carry live values of its own. Four more findings held. The
+        foreign-frame marker is a counter, not a bit: foreign code calls
+        back into ours, and the inner return would clear a marker the
+        outer frame still needs, which also mis-answers migration and
+        force-killability. corosensei carries no CET sequence — verified
+        in its x86_64 source — so "the library provides the full switch"
+        was false on any host with user shadow stacks. The TEB swap
+        omitted GuaranteedStackBytes, and "read the offset from the
+        running TEB" was incoherent. The QEMU assembly-coroutine citation
+        was wrong: that backend was never merged. Accepted in full;
+        document rewritten.
 - [ ] S2.3 `design/stacks.md`
       done: the document states the reservation and commit scheme per
         platform, the size classes, the pooling and release protocol, and

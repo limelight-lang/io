@@ -31,7 +31,7 @@ cancel and waits for its completion.
 | Module | Responsible for | Knows | Does not know | Depends on |
 |---|---|---|---|---|
 | `unit` | the execution unit and its handle | the two suspension kinds, the discriminant bit, the wait record | which backend completed an operation, what a socket is | `stack` |
-| `switch` | context switches | register sets per ABI, the live-register mask, the foreign-frame bit | scheduling policy, I/O, actors | `stack` |
+| `switch` | context switches | register sets per ABI, the TEB and shadow-stack swaps, the foreign-frame counter, the suspendable calling convention | scheduling policy, I/O, actors, the unit slot layout | `stack` |
 | `stack` | stack memory | reservation, lazy commit, size classes, pooling, guard bands | what runs on a stack | memory manager |
 | `sched` | mounting units on threads | run queues, stealing, mount and unmount hooks, actor context install | how a unit suspends internally, how an operation completes | `unit`, `switch` |
 | `pool` | object storage and enumeration | the layout of coroutines, sockets and timers; how each pool is walked | the meaning of a wait edge, the reactor backend | memory manager |

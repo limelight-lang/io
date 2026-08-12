@@ -329,9 +329,12 @@ simply left behind.
 the scheduler does not steal a pinned unit. Two things make a unit
 thread-affine:
 
-- a live foreign frame, marked by the same bit that decides how much a
-  context switch must save (`design/switching.md`), set on entry to
-  foreign code and cleared on return;
+- a live foreign frame, counted by the same depth counter that decides
+  how much a context switch must preserve (`design/switching.md`),
+  incremented on entry to foreign code and decremented on return. It is a
+  counter rather than a flag because foreign code calls back into ours,
+  and the inner call's return would otherwise clear a marker that the
+  outer frame still needs;
 - a consumer that declares its own frames thread-affine, per unit at
   creation. A consumer whose compiler we do not own knows what its code
   keeps in thread-local storage, and the substrate does not. The default
