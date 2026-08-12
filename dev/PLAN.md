@@ -34,11 +34,26 @@ order and the step the work continues from.
 Goal: the execution unit is specified before anything is built on it.
 Done when: S3 and S4 can be written without reopening any question in S2.
 
-- [ ] S2.1 `design/execution.md`
+- [~] S2.1 `design/execution.md`
       done: the document states what a unit is, how the two coroutine
         kinds share one handle, and what happens at mount and unmount,
         including the TLS rule across a suspension point
-      tier: T2 · role: —
+      tier: T2 · role: Critic
+      Critic 2026-08-12 round 1, on the section outline: twelve findings,
+        six of them high. The outline funnelled nothing — a stackful park
+        (a switch that never returns) and a stackless park (a record write
+        and `Pending` up the poll chain) reached the park primitive by
+        different paths, leaving the detector a hole it cannot report. It
+        blessed "parked" as a safepoint, though an I/O park suspends
+        mid-message while the actor contract rests on an empty stack
+        between messages. It gave wake no section, so the race between a
+        completion on another thread and an unfinished suspension had
+        nowhere to be resolved. It shaped the wait record for one wait,
+        though await-with-timeout is an OR of two. It stated a TLS rule
+        that foreign frames break by construction (errno, openssl's error
+        queue). And it left the poll ABI the Limelight compiler owes the
+        substrate unnamed, which `pool.md` would have had to invent.
+        Accepted in full; outline rewritten from ten sections to thirteen.
 - [ ] S2.2 `design/switching.md`
       done: the document states which registers a switch saves in each
         of the two cases, how the live-register mask reaches the switch,

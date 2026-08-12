@@ -164,3 +164,26 @@ Cost: the wake contract becomes a published API between crates, so
 changing it means a version bump even inside one repository. That is the
 price of letting a consumer skip the backends, and it falls on the
 boundary we most want stable anyway.
+
+## 2026-08-12 — Actors run on stackful units; stackless is the special case
+
+An actor always runs on a stackful unit. Stackless units stay available
+for cases that never need what a stack buys: a body the compiler
+transforms whole, which neither hosts an actor nor suspends below a
+foreign frame.
+
+The split is therefore not symmetric. Stackful is the default and carries
+the actor contract, because an actor may suspend at any depth — a
+synchronous call to another actor parks mid-message, and the frames below
+that point are ordinary compiled frames, some of them foreign. A
+stackless unit cannot suspend there at all: there is no way to return
+"pending" through a C frame.
+
+What this buys: the configuration that would otherwise need a policy —
+a stackless unit re-entered through foreign code that then awaits —
+becomes an error instead of a question. Limelight's compiler rejects it
+statically; the C ABI rejects it at runtime.
+
+Cost: two mount paths in the design, not one. Only the stackful path
+installs an actor context, so the stackless path must be readable as a
+restriction of it rather than as a second mechanism.
