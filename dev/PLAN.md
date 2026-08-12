@@ -153,7 +153,7 @@ rules and their behaviour on each of the four backends.
 - [ ] S3.3 `design/cancellation.md`
       done: the document states the two-phase teardown and the condition
         under which a stack and a buffer return to their pools
-      tier: T2 · role: —
+      tier: T2 · role: Critic
 
 ## S4 — Reliability  [ ]
 
