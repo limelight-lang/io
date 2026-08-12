@@ -365,3 +365,38 @@ reference count does all three jobs — whoever arms a half holds a
 reference, so the coroutine cannot die underneath it. What survives is
 the parking protocol itself: the four states, the order state-record-arm,
 the seqlock over the wait record, and the epoch identifying one wait.
+
+## 2026-08-12 — Re-mounting on another thread: the shape is fixed, the rule is open
+
+**Only an actor ever moves between threads.** An ordinary coroutine
+shares its thread's memory and is pinned for life, which is a
+consequence rather than a policy (entry above).
+
+**An actor moves only where it has stopped** — at the points where it
+reads from its mailbox, and where it is waiting. Not at an arbitrary
+instruction, and not merely because a completion happened to arrive on
+another thread's ring.
+
+Open, and to be researched rather than decided now:
+
+- exactly which points qualify. "Reading from the queue" is the message
+  boundary the actor model already names as a safepoint; "waiting" is
+  broader and needs to be enumerated, because a wait mid-message leaves
+  live frames and whatever the message has touched so far.
+- whether a per-suspension-point flag is needed at all. The argument that
+  it is not: for code we compile, nothing thread-affine survives a
+  suspension point by construction — no thread-local address is cached
+  across one, and a suspendable path carries no callee-saved registers
+  (`design/switching.md`) — so the only veto is a live foreign frame, and
+  the foreign-frame counter already answers that. The argument has not
+  been checked against real generated code, which is what makes this a
+  research item.
+- what a consumer over the C ABI declares, and when. Its code is opaque
+  to us, so the safe default is that it does not move, matching the
+  pinning default in `design/execution.md`. Whether the declaration
+  belongs on the actor at creation or somewhere finer is undecided.
+
+Until this closes, the implementation forwards every completion to the
+owning thread. That is correct under either answer and costs the
+forwarding path, which exists anyway for cross-thread cancels
+(`design/reactor.md`).
