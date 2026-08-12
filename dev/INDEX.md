@@ -4,7 +4,7 @@ Pointers only. What is written elsewhere is not repeated here.
 
 ## What this repo is
 
-Design documents for **io-core**: the execution and I/O substrate under
+Design documents for **io**: the execution and I/O substrate under
 Limelight. It carries coroutines, the scheduler, the reactor, and the
 deadlock detector. Limelight is its first consumer, not its only one:
 the substrate is reachable over a C ABI from languages whose compilers

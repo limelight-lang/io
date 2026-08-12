@@ -17,12 +17,12 @@ order and the step the work continues from.
       done: INDEX, WORKFLOW, ARCHITECTURE, DECISIONS, POSTMORTEM and PLAN
         exist, and DECISIONS carries the decisions already taken
       tier: T2 · role: —
-      handoff: repo at /home/edmond/limelight/io-core, branch main, one
+      handoff: repo at /home/edmond/limelight/io, branch main, one
         commit, no remote yet. WORKFLOW is a draft copied from
         limelight-lang/rfc and still needs Edmond's confirmation.
         Deadlock detection is deliberately not a decision: its mechanism
         is open and belongs to S4.1.
-- [ ] S1.2 Private `limelight-lang/io-core` and the first push
+- [ ] S1.2 Public `limelight-lang/io` and the first push
       done: `git ls-remote origin` returns refs
       tier: T1 · role: —
 
