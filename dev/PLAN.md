@@ -149,7 +149,7 @@ rules and their behaviour on each of the four backends.
       done: the document states the completion-first API, the three
         buffer contracts, how each degrades on IOCP, kqueue and epoll,
         and where zero-copy applies
-      tier: T2 · role: —
+      tier: T2 · role: Critic
 - [ ] S3.3 `design/cancellation.md`
       done: the document states the two-phase teardown and the condition
         under which a stack and a buffer return to their pools
