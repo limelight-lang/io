@@ -37,17 +37,20 @@ a foreign frame has nowhere to return `Pending` to.
 
 ## One handle, two kinds
 
-The scheduler queues one handle type. A handle is a pointer to the unit
-with the kind recorded in its low bits, which the unit slot's alignment
-leaves free. One bit is used today; the slot is aligned to at least four
-bytes so a second is available, and `design/pool.md` carries that as a
-constraint on the slot layout rather than as an accident of it.
+The scheduler queues one handle type: a 64-bit word naming a pool, a slot
+and the generation that slot held when the handle was taken
+(`design/pool.md`). It is not a pointer, and it carries no flags — the
+suspension kind is a field of the slot, which dispatch reads anyway.
 
 The wake path never inspects the kind: it moves a handle to a run queue.
-Dispatch reads it once, on mount, and branches to one of two resume
+Dispatch reads the kind once, on mount, and branches to one of two resume
 routines. Everything downstream of that branch differs; everything
 upstream is common, which is what keeps the two kinds from becoming two
 schedulers.
+
+The generation in the handle is what lets a waker tell "this unit's wait"
+from "whatever occupies that slot now". Without it a wake arriving after
+the unit completed would act on a stranger.
 
 ## Stackful units
 
@@ -87,19 +90,19 @@ Every other difference from a stackful resume follows from that.
 
 ### The waker the substrate hands to `poll`
 
-`waker` is a pair of a data pointer and one function, callable from any
-thread:
+`waker` is one function, callable from any thread:
 
 ```
-wake(data: *mut, half: u32, epoch: u64, result: Result)
+wake(unit: Handle, half: u32, epoch: u64, result: Result)
 ```
 
-The unit passes it to whatever will end the wait. `half` names which
-entry of the wait record is being ended, `epoch` is the value the record
-carried when that half was armed, and `result` is what the unit will
-read after it resumes. The algorithm behind this call is in "Waking",
-and it is the same call the reactor makes on a completion
-(`design/reactor.md`).
+The unit passes it to whatever will end the wait. `unit` is the 64-bit
+handle, generation included, so the call can tell this unit from whatever
+occupies its slot later. `half` names which entry of the wait record is
+being ended, `epoch` is the value the record carried when that half was
+armed, and `result` is what the unit reads after it resumes. The
+algorithm is in "Waking", and it is the same call the reactor makes on a
+completion (`design/reactor.md`).
 
 ### The worker stack is a bound, not a computation
 
@@ -118,9 +121,12 @@ The order is the protocol: a wait armed before the state moves would let a
 completion arrive with nowhere to record itself.
 
 1. **Enter `Parking`.** The unit stores `Parking` into its state word.
-2. **Write the record.** Entries, mode, `remaining` for an AND wait, and a
-   fresh `epoch`. Published with a release store, so a waker that reads
-   the state word with acquire sees the record whole.
+2. **Write the record as a seqlock.** Make the `epoch` odd, write the
+   entries, the mode and `remaining`, then make it even. The epoch is
+   both the wait's identity and the sequence number a reader uses to know
+   the entries belong to one wait (`design/pool.md`). Writing the epoch
+   first, as an earlier version did, lets a reader take the new entries
+   under the old epoch and compose a wait that never existed.
 3. **Arm each half.** Submit the operation, send the message, arm the
    timer — each carrying the waker, its half index, and the epoch from
    step 2. Arming after step 1 is what makes `Running` unreachable for a
@@ -179,12 +185,21 @@ state word still reads `Running`.
 `wake(data, half, epoch, result)` runs on whatever thread ended the wait,
 and it does five things in order.
 
-1. **Validate the epoch.** Read the record with acquire and compare its
-   epoch with the argument. A mismatch means this half was retired and the
-   unit has since parked on something else, so the call returns and does
-   nothing. Without this check a loser of a previous OR wait, firing
-   between the win and the retirement, would wake the unit out of an
-   unrelated wait with no half fired at all.
+1. **Validate the handle and the epoch.** Resolve the handle: a changed
+   generation means the slot belongs to someone else and the call
+   returns. Then read the record with acquire and compare its epoch with
+   the argument. A mismatch means this half was retired and the unit has
+   since parked on something else. Without the epoch check a loser of a
+   previous OR wait, firing between the win and the retirement, would wake
+   the unit out of an unrelated wait with no half fired at all; without
+   the generation check the same wake would land on a different unit
+   entirely.
+
+   Validating is not atomic with the writes that follow, so a slot
+   released between the two would take those writes. That is why a
+   released slot is not handed out until every worker has passed a
+   quiescent point (`design/pool.md`): the late writes land in memory
+   nobody owns, and step 5 then fails against a free state word.
 2. **Store the result** into the half's slot in the record. This is the
    only write a waker makes to the record besides the counter below, and
    the state word's release on the next steps is what publishes it.

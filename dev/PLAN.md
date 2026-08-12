@@ -140,11 +140,31 @@ release of its buffer.
 Done when: the three buffer contracts are stated with their ownership
 rules and their behaviour on each of the four backends.
 
-- [ ] S3.1 `design/pool.md`
+- [x] S3.1 `design/pool.md`
       done: the document states the object layout for coroutines, sockets
         and timers, the fields the wait edge occupies, and how a pool is
         walked while the system runs
       tier: T2 · role: Critic
+      Critic 2026-08-12 round 1: thirteen findings, five high, and two of
+        them broke the wake path. Validating a handle and then writing is
+        check-then-act: a slot released between the two takes the writes,
+        so a late waker stored a result into a stranger's record and woke
+        it out of a wait nothing satisfied. Reclamation is now deferred —
+        a released slot is not handed out until every worker has passed a
+        quiescent point — and the generation covers only the after-reuse
+        case. The handle contradicted execution.md outright: a pointer
+        with flags there, slab plus generation here, and `wake` carried no
+        generation at all, so "a wake validates both" was unimplementable.
+        The handle is now a 64-bit word with the generation in it, and
+        both documents say so. The walker re-read the epoch but not the
+        state word, and a unit's epoch changes only at its next park, so a
+        woken-and-running unit still validated as parked and closed a
+        phantom cycle. The record is now a seqlock with the epoch as its
+        sequence. An operation slot was released on "its completion",
+        which is wrong for zero-copy send (two), multishot (many) and a
+        cancelled operation (its own plus the cancel's). And the step's
+        own criterion was unmet: only the unit slot was laid out. Accepted
+        in full; document rewritten, execution.md patched in four places.
 - [ ] S3.2 `design/reactor.md`
       done: the document states the completion-first API, the three
         buffer contracts, how each degrades on IOCP, kqueue and epoll,
