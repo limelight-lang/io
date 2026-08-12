@@ -144,7 +144,7 @@ rules and their behaviour on each of the four backends.
       done: the document states the object layout for coroutines, sockets
         and timers, the fields the wait edge occupies, and how a pool is
         walked while the system runs
-      tier: T2 · role: —
+      tier: T2 · role: Critic
 - [ ] S3.2 `design/reactor.md`
       done: the document states the completion-first API, the three
         buffer contracts, how each degrades on IOCP, kqueue and epoll,
