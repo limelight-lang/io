@@ -168,7 +168,12 @@ boundary with the collector is stated.
         of a result against a moving system, what is shared with the
         collector and what is not, and the victim policy
       tier: T2 · role: Critic
-- [ ] S4.2 `README.md`
+- [x] S4.2 `README.md`
       done: a reader who has read only the README knows what the project
         is and in what order to read the design documents
       tier: T1 · role: —
+      handoff: README.md states the eight pillars, the two rules that
+        carry the rest, the reading order and the crate graph. The two
+        rules are the ones worth defending in review: nothing
+        kernel-visible on a stack, and one park primitive that records
+        both halves of a wait.
