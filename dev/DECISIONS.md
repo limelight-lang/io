@@ -1,0 +1,141 @@
+# Decisions
+
+Architectural decisions, newest last. What was decided, why, what was
+rejected, and what it costs. Superseding a decision means a new entry,
+never an edit of the old one.
+
+## 2026-08-12 — Rust for the core, C ABI at the surface
+
+The substrate is written in Rust, and every foreign consumer reaches it
+over a C ABI. Limelight already fixed Rust for its runtime core
+(`rfc/runtime/implementation-language.md`), and this repo plugs straight
+into that scheduler, so a second language on the boundary would add an
+FFI hop to every wake. Completion-based I/O decides it independently:
+io_uring keeps the submitted buffer until the completion arrives, and
+Rust's type system is what enforces that lifetime instead of author
+discipline.
+
+Rejected: C, which would fit php-src but not the Limelight core; C++,
+which `implementation-language.md` deliberately confines to the thin
+LLVM layer.
+
+Cost: coroutine migration between threads cannot be expressed in safe
+Rust and stays an `unsafe` contract of ours (see the scheduler entry).
+
+## 2026-08-12 — Our own scheduler, borrowed primitives
+
+We write the scheduler and take the primitives under it. No external
+scheduler mounts an actor: the loop between two tasks must install the
+actor's arena into TLS, treat a message boundary as a safepoint, and
+deliver the collector's handshake as an ordinary message
+(`rfc/runtime/actors.md`). Those are its internals, not its settings.
+
+Taken: `corosensei` for context switching (MIT/Apache-2.0; seven
+architectures over ELF, Darwin, Windows and UEFI; public `Stack` trait
+for our own allocator), `crossbeam-deque` for work stealing,
+`io-uring`/`polling`/`mio` for the reactor backends.
+
+Rejected: Photon and bthread, both Apache-2.0 and both C++, which would
+turn the thin C++ layer into a second runtime on the wake path; tokio,
+whose task model is stackless and closed to foreign C-ABI callers; `may`,
+whose spawn is `unsafe` because a coroutine touching TLS after migrating
+threads is undefined — the exact hazard our migrating actors sit on.
+
+Cost: the migration hazard is ours to solve either way. `corosensei`
+marks `Coroutine` as `!Send`, so moving one between threads is our
+`unsafe` obligation, and TLS may not be cached across a suspension point.
+
+## 2026-08-12 — Two coroutine kinds behind one handle
+
+The scheduler queue holds one handle kind, and the suspension mechanism
+under it varies: a stackful context switch, or a state machine driven by
+a poll. Languages whose compilers we do not own get the stackful kind,
+which needs nothing but a C ABI. Limelight gets the stackless kind where
+its compiler can emit the state machine, and pays no stack at all.
+
+Rejected: picking one kind for everything. Stackless alone excludes every
+foreign language, because a foreign frame cannot be transformed and
+therefore cannot suspend. Stackful alone charges Limelight a stack it
+does not need.
+
+Cost: the wake path must not branch on the kind before dispatch, so the
+handle carries the discriminant in a spare pointer bit.
+
+## 2026-08-12 — Completion-first I/O API; io_uring is a backend
+
+The API is shaped around completion ("submit this operation with this
+buffer, receive the result"), not readiness ("tell me when the fd is
+readable"). io_uring and Windows IOCP are both completion-based, and a
+readiness backend emulates completion by issuing the syscall when the fd
+signals. The reverse direction loses what io_uring is for.
+
+io_uring is therefore the fast path on server Linux rather than the
+foundation: Android blocks it from apps through seccomp-bpf, ChromeOS
+disables it, and the default seccomp profiles of Docker and containerd
+reject it. Backends: io_uring, IOCP, kqueue, epoll.
+
+Cost: the buffer becomes part of the API contract, because the kernel
+owns it from submission until completion. Zero-copy send splits this
+further — it returns two completions, the result and the
+`IORING_CQE_F_NOTIF` that releases the buffer — so "operation finished"
+and "buffer returned" are two events in the contract, not one.
+
+## 2026-08-12 — Stacks are reserved whole and committed lazily
+
+A stackful coroutine reserves its stack as one mapping and touches only
+the pages it uses. Measured on Linux 6.6 (WSL2, 4 KB pages): 10 000
+stacks of 2 MB with one page touched cost 40 272 KB of RSS, or 4.0 KB
+per coroutine, against 20 GB of address space. Touching 64 KB of each
+costs 64.0 KB per coroutine. The reserved size is address space, and
+64-bit address space is not the scarce resource.
+
+Rejected: segmented or chunked growth. It needs a prologue check in
+every function, which a foreign ABI does not have, and the guard-page
+fault arrives too late to switch stacks — `sub rsp, N` has already run
+and the faulting instruction addresses the frame it just made. The only
+resumable answer is to map a page where the access happened, which is
+in-place growth, which is what reserving already gives.
+
+Cost: mappings, not memory. With one guard page per stack the ceiling is
+`vm.max_map_count / 2` — measured as 32 754 stacks against the default
+65530. Past that: raise the sysctl, or carve stacks out of slabs and
+detect overflow on return to the scheduler instead of by guard page.
+
+Open: a frame larger than a page can step over the guard (stack clash).
+Either probe large frames, as `gcc -fstack-clash-protection` does, or
+make the guard band as wide as the largest frame we emit.
+
+## 2026-08-12 — Deadlock detection: three constraints fixed, the mechanism open
+
+The mechanism is undecided and is the subject of `design/deadlock.md`
+(PLAN.md, S4.1). Candidates: an explicit wait-for graph maintained at
+park time, or a scan over the object pools that reconstructs the same
+relation on demand. Three constraints hold under either.
+
+**Quiescence is not the criterion.** `php-src/ext/async` uses it:
+`resolve_deadlocks()` fires only when the whole process has no active
+events and no runnable coroutines. A cycle of three coroutines among two
+hundred busy ones never surfaces, and quiescence does not prove a cycle
+either, which is why that code carries a last-chance reactor drain
+against false positives. Detection here starts from wait age instead, the
+way PostgreSQL arms `deadlock_timeout` (1 s by default) rather than
+checking on every wait.
+
+**Both halves of a wait are recorded.** `ext/async` stores what a
+coroutine waits for (`waker->events`) but not who will post it, and
+without the second half no cycle can be closed — which is why its
+channels fall back to 5 s timeouts and a bulk close. Every suspension
+goes through a single park primitive that records both. A wait registered
+anywhere else is a hole, and the hole is not self-diagnosing.
+
+**Detection may not depend on the collector finishing a cycle.** A
+deadlocked actor never reaches a message boundary, so it never answers
+the collector's handshake: a deadlock stalls mark termination, and a
+detector waiting on the collector would be unavailable exactly when it is
+needed. It needs no handshake of its own, because it reads only parked
+units and a parked unit does not mutate. Sharing the collector's walker,
+header discipline and epoch bytes stays on the table; sharing its trigger
+does not.
+
+Kept from `ext/async`: binding a channel to the scope that created it.
+That one is driven by lifetime rather than by a timeout.
