@@ -15,13 +15,13 @@ compiles none of the platform backends.
 
 | Crate | Holds | Depends on |
 |---|---|---|
-| `io-exec` | `unit`, `switch`, `stack`, `sched`, `pool`, `deadlock` | memory manager |
-| `io-reactor` | `reactor` and the four backends, each behind a cargo feature | `io-exec` |
-| `io-api` | the public surface and the C ABI | `io-exec`, `io-reactor` |
+| `io-core` | `unit`, `switch`, `stack`, `sched`, `pool`, `deadlock` | memory manager |
+| `io-reactor` | `reactor` and the four backends, each behind a cargo feature | `io-core` |
+| `io-api` | the public surface and the C ABI | `io-core`, `io-reactor` |
 
-`io-reactor` knows `io-exec`; the reverse dependency does not exist and
+`io-reactor` knows `io-core`; the reverse dependency does not exist and
 must not appear. Cancellation crosses this boundary, so it is split
-rather than shared: `io-exec` cancels a unit through an opaque cancel
+rather than shared: `io-core` cancels a unit through an opaque cancel
 handle stored in the wait record, and whoever parked the unit installed
 that handle. `io-reactor` supplies one that submits the kernel-side
 cancel and waits for its completion.

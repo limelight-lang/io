@@ -149,10 +149,10 @@ Keeping both in one workspace keeps the wake contract — a completion
 resumes a unit — changeable in one commit, and that contract is
 co-designed with the unit rather than layered on top of it.
 
-Layout: `io-exec` (unit, switch, stack, sched, pool, deadlock),
+Layout: `io-core` (unit, switch, stack, sched, pool, deadlock),
 `io-reactor` (submission, completion, four backends behind cargo
 features), `io-api` (public surface and the C ABI). Dependencies point
-from `io-api` down to `io-reactor` down to `io-exec`; the reverse edge
+from `io-api` down to `io-reactor` down to `io-core`; the reverse edge
 does not exist.
 
 Rejected: `io-rt` as the first crate's name, because it abbreviates
