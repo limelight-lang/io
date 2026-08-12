@@ -73,7 +73,7 @@ Done when: S3 and S4 can be written without reopening any question in S2.
         Exactly one enqueue per wake, decided by that CAS. Open and owed
         to another repo: mark termination waits on the slowest parked
         operation, which belongs in rfc/BACKLOG.md and is not there.
-- [ ] S2.2 `design/switching.md`
+- [x] S2.2 `design/switching.md`
       done: the document states which registers a switch saves in each
         of the two cases, how the live-register mask reaches the switch,
         and how the foreign-frame bit is set and cleared
@@ -99,6 +99,13 @@ Done when: S3 and S4 can be written without reopening any question in S2.
         running TEB" was incoherent. The QEMU assembly-coroutine citation
         was wrong: that backend was never merged. Accepted in full;
         document rewritten.
+      handoff: design/switching.md, 200 lines. The load-bearing reversal
+        is that narrowing is a calling convention, not a mask, and the
+        park primitive's tail must be assembly for it to apply. The
+        foreign-frame marker is a counter with three readers — the
+        switch, migration, force-killability — so a unit that opts out of
+        maintaining it reads as permanently non-zero. CET is ours to
+        write: corosensei has no shadow-stack support.
 - [ ] S2.3 `design/stacks.md`
       done: the document states the reservation and commit scheme per
         platform, the size classes, the pooling and release protocol, and
