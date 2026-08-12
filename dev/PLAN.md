@@ -1,6 +1,6 @@
 # PLAN
 
-Updated: 2026-08-12 · Active: S3
+Updated: 2026-08-12 · Active: none — every stage closed
 
 A document closes when it answers its own question without reference to
 the conversation it came from, and when every cross-reference in it
@@ -133,7 +133,7 @@ Done when: S3 and S4 can be written without reopening any question in S2.
         unspecified, and one order corrupts. Accepted in full; document
         rewritten.
 
-## S3 — Objects and I/O  [in progress]
+## S3 — Objects and I/O  [done]
 
 Goal: an operation can be described end to end, from submission to the
 release of its buffer.
@@ -217,19 +217,40 @@ rules and their behaviour on each of the four backends.
         execution.md's forced teardown removed — a unit always unwinds
         itself.
 
-## S4 — Reliability  [ ]
+## S4 — Reliability  [done]
 
 Goal: a wait cycle is found while the process is busy, and reported as
 data.
 Done when: the detector is specified for both AND and OR waits, and its
 boundary with the collector is stated.
 
-- [ ] S4.1 `design/deadlock.md`
+- [x] S4.1 `design/deadlock.md`
       done: the document picks between a maintained wait-for graph and a
         scan over the pools, and states both wait models, the validation
         of a result against a moving system, what is shared with the
         collector and what is not, and the victim policy
       tier: T2 · role: Critic
+      Critic 2026-08-12 round 1: fourteen findings, five high, and the
+        first invents a deadlock in a system where nothing is racing. The
+        search read posters and ignored the decision fields, so a unit in
+        an AND wait whose first half had already fired — and which was
+        therefore waiting only on the kernel — was marked blocked because
+        the fired half still pointed back into the set. It now reads the
+        winner, `remaining` and the fired flags and considers only
+        outstanding halves. The trigger had no mechanism at all: a parked
+        unit has no worker and no timer, and PostgreSQL's waiter is an OS
+        process that can arm one for itself. A watchdog goes into the
+        reactor's timer wheel at park time, and only for a wait with no
+        kernel half — which is what keeps a hundred thousand idle
+        connections at zero cost. The poster field went stale on ownership
+        transfer, so edges now run unit → resource → unit and the owner is
+        read fresh; that also gives the actor edge somewhere to land. Two
+        concurrent searches could confirm overlapping sets and kill two
+        victims, so a search claims its set with one CAS — the detector's
+        only write. The victim was chosen from the reachable set rather
+        than from the cycle core, which kills bystanders while the cycle
+        survives. Accepted in full; document rewritten, pool.md and
+        execution.md aligned to the resource-owner indirection.
 - [x] S4.2 `README.md`
       done: a reader who has read only the README knows what the project
         is and in what order to read the design documents

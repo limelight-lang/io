@@ -231,18 +231,25 @@ wait. It carries one entry per half:
 
 | Field | Meaning |
 |---|---|
-| resource | an opaque identifier of what is being waited on |
-| poster | who will end this half |
+| resource | the handle of what is being waited on: a mutex, a channel, an actor, an operation, a timer |
 | cancel | an opaque handle that ends this half early |
 | result | where the waker stores what the unit will read |
+| fired | whether this half has already been satisfied |
+
+**The record names a resource, not the unit that will end the wait.** Who
+owes the wait is a field of the resource's own slot, read fresh when
+anyone asks (`design/pool.md`). Naming a unit directly goes stale the
+moment a resource changes hands: two units parked on one mutex both record
+its holder, the holder releases it and finishes, its slot is reused, and
+the second waiter's record now names a stranger.
 
 and, once per record: the mode, `remaining` for AND, the winner field for
 OR, and the `epoch` that every armed half carries.
 
-**The poster** is a unit, an actor, the kernel, or a set. A set is the
-case of a channel with several registered senders, where no single party
-owes the wake. `design/deadlock.md` treats a set edge as satisfiable by
-any of its members, which is why the modes below matter to it.
+**A resource says who owes it.** A mutex names its holder, an actor names
+the unit processing its current message, an operation names the kernel, a
+channel names its registered senders. `design/deadlock.md` reads those
+fields; nothing here does.
 
 **The mode:**
 
@@ -253,10 +260,11 @@ any of its members, which is why the modes below matter to it.
 
 `await` with a timeout is the ordinary OR: a timer and an operation.
 
-Recording only the resource would give half an edge, and half an edge
-cannot close a cycle. The `poster` field is what makes the record more
-than a debugging aid, and it is the field `php-src/ext/async` does not
-have (`dev/DECISIONS.md`, 2026-08-12).
+Recording what a unit waits on, without anything saying who owes it, gives
+half an edge, and half an edge cannot close a cycle. `php-src/ext/async`
+records exactly that half (`dev/DECISIONS.md`, 2026-08-12). Here the other
+half lives in the resource, which is what keeps it true as ownership
+moves.
 
 **Writers and readers.** The unit writes the record while `Running`, in
 step 2 of parking. A waker writes one result slot and one counter, in the

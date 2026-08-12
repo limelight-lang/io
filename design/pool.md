@@ -121,9 +121,12 @@ never existed.
 ## Walking a live pool
 
 A walker iterates slabs and slots, reads each header with an acquire load,
-and skips anything not in the state it wants. It writes nothing. The
-deadlock detector is the first consumer and a diagnostic dump the second
-(`design/deadlock.md`).
+and skips anything not in the state it wants. Its consumer is the
+diagnostic dump that answers "what is everything waiting on". The deadlock
+detector does **not** walk the pool: it follows resource handles from one
+slot to the next, which costs the reachable subgraph rather than the
+population (`design/deadlock.md`). The rules below serve both, because
+both read slots other threads are writing.
 
 **What a validated read guarantees, exactly:** that at some instant
 between the two epoch loads, this slot held this occupant, parked on this
@@ -156,8 +159,8 @@ chasing.
 |---|---|
 | header | `state`, `generation`, `kind` |
 | suspension | kind (stackful or stackless), stack pointer for the former, state-machine pointer and its vtable for the latter |
-| wait | mode, `epoch`, `remaining`, winner, and two entries: resource handle, poster handle, cancel handle, result |
-| scheduling | run queue link, the foreign-frame counter, the affinity flag, the cancelled mark |
+| wait | mode, `epoch`, `remaining`, winner, the detector's claim word, and two entries: resource handle, cancel handle, result, fired |
+| scheduling | run queue link, the foreign-frame counter, the affinity flag, the retryable flag the consumer sets at creation |
 | consumer | one opaque word the mount hook owns, where Limelight keeps its actor context |
 
 The saved machine context is not here: it sits at the top of the unit's
@@ -212,14 +215,36 @@ kernel does not always owe exactly one:
 The slot is released, and its buffer unpinned, when the owed count
 reaches zero and not before.
 
+### Resource
+
+Anything a unit can wait on has a slot, and every such slot answers one
+question: who owes this wait right now.
+
+| Resource | Owner field |
+|---|---|
+| mutex, semaphore | the unit holding it |
+| actor | the unit processing its current message, or none |
+| channel | its registered senders, or its registered receivers |
+| operation | the kernel |
+| timer | the wheel |
+
+A wait record names the resource; the resource names its owner, read fresh
+by whoever asks. That indirection is what keeps an edge true when a mutex
+changes hands and the previous holder's slot is reused
+(`design/deadlock.md`).
+
+A consumer that builds a mutex or a channel of its own over the C ABI
+takes on keeping its owner field truthful. Nothing checks it, and the
+detector's promise never to invent a deadlock rests on it.
+
 ### Buffer, socket, timer
 
 A buffer slot is a header, a length, the registered index if the pool is
 registered, and the payload. A socket slot is a header, the descriptor or
-its registered index, and the queue a multishot operation appends to
-(`design/reactor.md`). A timer slot is a header, a deadline, and the
-waiter's handle with its half and epoch. None of them carries a wait
-record: only units wait.
+its registered index, and the head and tail of the queue a multishot
+operation appends to (`design/reactor.md`). A timer slot is a header, a
+deadline, and the waiter's handle with its half and epoch. None of them
+carries a wait record: only units wait.
 
 ## Allocation and release
 

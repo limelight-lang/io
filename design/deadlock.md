@@ -3,204 +3,252 @@
 ## What is detected
 
 A set of units is deadlocked when none of them can ever proceed, because
-each is waiting on something only another member of the set could supply.
-The substrate detects exactly that and reports it as data: which units,
-what each waits for, and who each expected to supply it.
+each waits on something only another member could supply. The substrate
+detects that and reports it as data: which units, what each waits for, and
+who each expected to supply it.
 
-What it does not detect, stated first so the boundary is not mistaken for
-a bug:
+What it does not detect:
 
 - **A wait that will end late is not a deadlock.** An operation in the
-  kernel completes or errors; a timer fires. Either makes a wait live, and
-  a live wait cannot be part of a proved cycle.
+  kernel completes or errors; a timer fires.
 - **A cycle through the outside world is invisible.** Two processes
-  waiting on each other's sockets are deadlocked and nothing here can see
-  it: the substrate's graph ends at the kernel.
-- **A wait with a timer in it is never proved deadlocked.** The timer is a
-  live half, so the set is not stuck by this definition. That is correct
-  and it is also why timeouts hide deadlocks rather than solve them.
+  waiting on each other's sockets are deadlocked and the graph ends at the
+  kernel.
+- **An OR wait containing a timer is never proved deadlocked**, because
+  the timer is a live half and any live half satisfies an OR. This does
+  not extend to AND: a unit waiting for *both* a timer and a member of a
+  dead set never proceeds, and is reported.
 
-## The graph is the wait records
+## Edges run unit → resource → unit
 
-There is no separate graph structure, and no registry. Every parked unit's
-wait record already holds both halves of every edge: what it waits for,
-and who will end that wait (`design/execution.md`). Traversal reads the
-`poster` field of a record and lands in another slot.
+A wait record's entry does not name the unit that will end the wait. It
+names a **resource** — a mutex, an actor, a channel, an operation, a timer
+— and the resource's own slot records who currently owes it
+(`design/pool.md`). Traversal is two hops, and the second is read fresh at
+traversal time.
 
-This is the choice the plan left open, and the pools are what settle it.
-A maintained graph would duplicate the records and could disagree with
-them; a scan of the whole pool would cost the population rather than the
-question. Following poster links from one unit costs the reachable
-subgraph and nothing more.
+Recording a unit directly was the first design and it is wrong under
+ownership transfer. Mutex M is held by unit 1; units 2 and 3 park on it,
+both recording poster = unit 1. Unit 1 releases M, wakes unit 2, finishes,
+and its slot is reused. Unit 3's record now names a slot holding a
+stranger. Treating that as a dead edge invents a deadlock for unit 3 while
+unit 2 is milliseconds from releasing M; treating it as live loses the
+real case where a channel's last sender exits without sending. Neither
+answer is right, so the edge does not go stale in the first place: unit 3
+names M, and M names whoever holds it now.
 
-A full pool scan exists for one purpose only: the diagnostic dump that
-answers "what is everything waiting on", which is a human's question and
-not the detector's (`design/pool.md`).
+Actors are resources too. A unit awaiting a reply names the actor; the
+actor's slot carries its mailbox state and the handle of the unit
+processing its current message, and traversal continues from there. That
+is how an actor-mediated cycle closes, which is the case the actor model
+raises as an open question and the reason this detector exists.
 
-## The trigger is wait age
+## The trigger: a watchdog on waits that could be cycles
 
-A unit that has been parked longer than a threshold runs the search
-itself, on its own worker, before the worker looks for other work. Below
-the threshold nothing runs at all.
+A search runs when a wait has aged past a threshold. Two mechanisms were
+possible and one of them does not exist: a parked unit has no worker and
+no thread, so it cannot check its own age.
 
-This is PostgreSQL's arrangement, where `deadlock_timeout` defaults to one
-second and the waiter checks only after it expires. The cost in the common
-case is zero, and a cycle is found while the rest of the process is busy.
+**A unit that parks arms a watchdog entry in the timer wheel** — the same
+wheel the reactor already runs — and disarms it when the wait ends. The
+wheel firing is what starts the search, on whichever worker services the
+wheel.
 
-The alternative — declaring deadlock when the whole process falls quiet —
-is what `php-src/ext/async` does, and it fails in both directions
-(`dev/DECISIONS.md`, 2026-08-12). Three units in a cycle among two hundred
-busy ones never make the process quiet, so the cycle is never found. And
-quiet does not prove a cycle, which is why that code carries a last-chance
-reactor drain against its own false positives.
+**Only waits that could possibly be cycles arm one.** A wait with any half
+that the kernel will end cannot be proved deadlocked, so it arms nothing.
+That is what keeps the cost off the common path: a server with a hundred
+thousand idle connections has a hundred thousand waits on the kernel and
+zero watchdogs. Mutexes, channel receives and synchronous actor calls arm
+one; reads, writes and accepts do not.
 
-## Blocked, and the two wait modes
+The threshold is PostgreSQL's arrangement in spirit — check after a wait
+gets old rather than on every wait — but not its mechanism: there the
+waiter is an operating-system process that can arm a real timer for
+itself, and a parked unit is not.
 
-The search computes which units are permanently blocked. It starts by
-assuming every parked unit reachable from the suspect is blocked, then
-removes the ones that are not, until nothing more can be removed.
+## Blocked, and what the search reads
+
+The search computes which units are permanently blocked: assume every
+parked unit reachable from the suspect is blocked, then remove the ones
+that are not, until nothing more can be removed.
+
+**A half that has already fired is not a wait.** The search reads the
+record's winner field, its `remaining` counter and each half's fired flag,
+and considers only halves still outstanding. Ignoring them produces a
+false deadlock in a system where nothing is moving at all: a unit in an
+AND wait whose first half already fired, and whose second half is a kernel
+operation, is waiting only on the kernel — but an algorithm that looks at
+posters alone sees a half pointing back into the set and marks it blocked.
+
+**A wait already decided is not a wait.** If the winner field is claimed,
+the unit is owed a wake and only the state word has yet to move. Such a
+unit is live no matter what its entries say.
 
 A **half** is live when what it waits on will act without help from the
-set: an operation the kernel has accepted, an armed timer, a message to a
-unit that is runnable or running, a resource with a poster outside the
-set.
+set: a kernel operation, an armed timer, a resource whose current owner is
+runnable or outside the set.
 
 A **unit** is not blocked when:
 
 | Mode | Not blocked if |
 |---|---|
-| OR — continues when any half fires | **any** half is live |
-| AND — continues when every half fires | **every** half is live |
+| OR | **any** outstanding half is live |
+| AND | **every** outstanding half is live |
 
-Removing one unit can make another live, so the removal repeats to a
-fixed point. Whatever is still marked blocked at the end, and reachable
-from the suspect, is deadlocked.
+Removing one unit can make another live, so removal repeats to a fixed
+point. What is still marked and reachable from the suspect is deadlocked.
 
-The two modes are why a single algorithm covers both cases the literature
-separates. Under AND alone the answer is a cycle; under OR alone it is a
-knot — a set no path leaves. The fixed-point removal computes both without
-distinguishing them, because the modes are already in the records.
+The two modes are why one algorithm covers both cases the literature
+separates: under AND alone the answer is a cycle, under OR alone a knot,
+and the modes are already in the records.
 
 ### A worked case
 
 ```
-unit 1  AND  [ reply from unit 2 ]                       parked
-unit 2  OR   [ mutex M held by unit 1, timer 5 s ]       parked
+unit 1  AND  [ reply from actor B ]                     parked
+unit 2  OR   [ mutex M, timer 5 s ]                     parked, running B's message
 ```
 
-Unit 2 has a live half — the timer — so it is removed. Unit 1's only half
-waits on unit 2, which is not blocked, so unit 1 is removed too. No
-deadlock is reported, and the report is right: in five seconds unit 2
-resumes with a timeout.
+Unit 2 has a live half, so it is removed; unit 1 waits on actor B, whose
+current unit is unit 2, which is not blocked, so unit 1 is removed. No
+report, and rightly: in five seconds unit 2 resumes with a timeout.
 
-Remove the timer and nothing is live: unit 2 waits on a mutex held by unit
-1, unit 1 waits on a reply from unit 2, both stay marked, and the pair is
-reported.
+Remove the timer and nothing is live. Unit 2 waits on M, held by unit 1;
+unit 1 waits on B, whose current unit is unit 2. Both stay marked and the
+pair is reported.
 
 ## Reading a moving system
 
-The search reads slots that other threads are writing. Three rules make
-its answer sound, and each closes a specific way of being wrong.
+The search reads slots other threads are writing. Four rules make its
+answer sound, and each closes a specific way of being wrong.
 
-- **Read only parked units.** A unit in `Parked` is not executing, so its
-  record is stable while it stays there (`design/execution.md`).
-- **Validate every slot twice.** After collecting a slot's fields, re-read
-  its generation and its epoch. A change means the unit woke and possibly
-  parked again, so the fields may belong to two different waits, and the
-  slot is discarded. Without this the search composes a cycle out of two
-  waits that never coexisted (`design/pool.md`).
-- **Confirm the whole set before reporting.** After the fixed point, walk
-  the set again and check every generation and epoch is unchanged since
-  the first pass. Any change abandons the search. A deadlock does not
-  disappear, so abandoning costs one repetition; reporting a phantom costs
-  a victim.
+- **Read only units whose state word says `Parked`,** re-read with
+  acquire. A unit's epoch moves when it parks *again*, not when it wakes,
+  so a woken-and-running unit is otherwise indistinguishable from an
+  untouched one (`design/pool.md`).
+- **Read the record as a seqlock.** The epoch is odd while entries are
+  being written, and a reader that sees an odd or changed epoch discards
+  the slot.
+- **Read the decision fields, not only the entries** — winner,
+  `remaining`, fired flags — because a waker changes those without
+  touching the state word or the epoch. A search that ignores them reports
+  a unit that is already owed a wake.
+- **Re-validate the whole set before reporting.** Slots are validated at
+  different instants, so a set assembled from them was never observed
+  simultaneously. After the fixed point, every member's state word,
+  generation, epoch and decision fields are re-read; any change abandons
+  the search.
 
-The result is a design that misses a real cycle occasionally and never
-invents one. That direction is deliberate: a missed cycle is found on the
-next threshold expiry, and a false one kills a healthy unit.
+The result misses a real cycle occasionally and never invents one. A
+missed cycle is found at the next watchdog expiry; a false one kills a
+healthy unit.
 
-## What is shared with the collector, and what is not
+### Two searches must not both act
 
-The collector already walks object graphs and already stamps epochs, so
-the walker, the header discipline and the epoch bytes are shared rather
-than reinvented beside them (`dev/DECISIONS.md`, 2026-08-12).
+Every member of a cycle, and every unit hanging off it, can expire
+independently, so two workers can search overlapping sets at once, both
+confirm, and both kill a victim.
+
+**A search that reaches the confirmation stage claims its set**, with a
+compare-and-swap on a claim word in the suspect's slot. This is the one
+write the detector makes, and it is the exception to "the detector writes
+nothing": a search that loses the claim abandons and lets the winner act.
+The claim is released when the victim's cancellation is delivered.
+
+## The victim
+
+A confirmed set is reported and one member is failed so the rest proceed.
+
+**The victim is chosen from the core** — the members that are actually in
+the cycle or the knot — and never from a unit merely waiting on it. The
+reachable set includes both, and failing a bystander leaves the cycle
+intact and the next expiry kills another bystander.
+
+Within the core, in order:
+
+1. **Skip anything that cannot be failed.** A unit parked below a live
+   foreign frame will never reach another suspension point, so cancelling
+   it does nothing (`design/cancellation.md`). It is not chosen last; it
+   is not chosen.
+2. **Prefer a unit the consumer marked retryable.** The flag is set at
+   creation and lives in the unit slot (`design/pool.md`); the consumer
+   knows what is safe to repeat and the substrate does not.
+3. **Prefer the youngest wait**, which has done the least work.
+
+Failing a unit is cancellation, and cancellation is delivered through the
+state word rather than through a half, which matters here: a wake aimed at
+one half of an AND wait would decrement a counter and return without
+waking (`design/cancellation.md`).
+
+**When the core has no failable member**, the set is reported with no
+victim. The process keeps running with that set stuck and the diagnostic
+says so. The alternative is unwinding frames that were not compiled for
+it, which trades a diagnosable hang for a crash of unknown shape.
+
+## The report
+
+A report is a value: the set, each member's identity and outstanding wait,
+each resource and its owner, and which member was failed. It is built in a
+report slot taken from a pool, and its handle travels two ways — to the
+failed unit, as the result it resumes on, and to a diagnostic channel any
+consumer can poll. The second path is what covers a set with no victim,
+where nobody resumes to receive anything.
+
+`php-src/ext/async` prints its wait graph to standard output under a debug
+flag, which puts the information exactly where it cannot be used.
+
+## What is shared with the collector
+
+The collector walks object graphs and stamps its own epochs, so the walker
+and the header discipline are worth sharing. **The epoch bytes are not
+shared:** a collector stamp landing between a half being armed and its
+completion would fail the waker's epoch check and lose the wake. Whether
+anything beyond the walker is shared remains open in the decisions journal
+and this document does not close it.
 
 The trigger and the protocol are not shared, and the reason is sharp: a
 deadlocked actor never reaches a message boundary, so it never answers the
 collector's handshake. A deadlock stalls mark termination, and a detector
-that waited for the collector would be unavailable exactly when it is
-needed (`rfc/BACKLOG.md`, 2026-08-12). It needs no handshake of its own,
-because it reads only parked units.
-
-## The victim
-
-A proved set is reported, and one member is failed so the rest proceed.
-The choice is a policy with a default rather than a law:
-
-1. **Prefer a unit that can be failed at all.** A unit with a live foreign
-   frame cannot be unwound (`design/execution.md`), so it is chosen last.
-2. **Prefer the youngest wait.** It has done the least work, so failing it
-   discards the least.
-3. **Prefer a unit whose consumer declared it retryable.** The consumer
-   knows what is safe to repeat; the substrate does not.
-
-Failing a unit is cancellation, not a new mechanism: retire its halves,
-wake it with a deadlock result carrying the whole set
-(`design/cancellation.md`).
-
-**When every member is unkillable** — each parked below a foreign frame —
-nothing can be failed and the set is reported without a victim. The
-process keeps running with that set stuck, and the diagnostic says so.
-This is the honest outcome: the alternative is unwinding through frames
-that were not compiled for it, which is undefined and would trade a
-diagnosable hang for a crash of unknown shape.
-
-## The report
-
-A detection produces a value, not a log line: the set, each unit's
-identity and wait, each poster, and which member was failed. It reaches
-the consumer through the same result slot the failed unit resumes on, and
-through a diagnostic channel any consumer can poll. `php-src/ext/async`
-prints its wait graph to standard output under a debug flag, which means
-the information exists exactly where it cannot be used.
+waiting on the collector would be unavailable exactly when it is needed
+(`rfc/BACKLOG.md`, 2026-08-12). It needs no handshake, because it reads
+only parked units.
 
 ## Cost
 
-- **Below the threshold:** nothing. No counter, no list, no barrier on the
-  park path beyond the record write that already happens.
-- **At the threshold:** one traversal of the subgraph reachable from one
-  unit, plus one confirmation pass over the set found. Both are reads.
-- **The park path pays** the `poster` field and the epoch, which the record
-  carries for other reasons as well.
+- **On the park path:** one watchdog insert, and only for a wait with no
+  kernel half.
+- **At expiry:** one traversal of the subgraph reachable from one unit,
+  one confirmation pass, one claim.
+- **Never:** a scan of the pool. That exists for the human-facing
+  diagnostic dump and is not on this path (`design/pool.md`).
 
-No figure is claimed here. The traversal is bounded by reachability rather
-than by population, and how large that is in practice is a measurement
-against real programs that does not exist.
+No figure is claimed. The traversal is bounded by reachability and how
+large that is in practice is a measurement against real programs.
 
 ## Decided elsewhere
 
 | Question | Document |
 |---|---|
 | the wait record, the epoch, the parked state | `design/execution.md` |
-| slots, generations, and walking | `design/pool.md` |
-| retiring halves and waking with a result | `design/cancellation.md` |
+| slots, generations, resources and their owners | `design/pool.md` |
+| delivering a failure to a unit | `design/cancellation.md` |
 | what an operation waiting in the kernel means | `design/reactor.md` |
 
 ## Open questions
 
-- **The threshold.** One second is PostgreSQL's default for a database's
-  lock waits, and nothing says it fits a runtime whose waits are mostly
-  I/O. It is a deployment parameter with no measurement behind it.
-- **Repeated searches on the same set.** A stuck set with no killable
-  member is re-detected by every member at every threshold expiry, which
-  turns a permanent hang into a permanent stream of traversals. A
-  suppression window per set is the obvious answer and is not designed.
-- **Set-valued posters.** A channel with several registered senders has a
-  poster that is a set, and the search treats a live member as making the
-  half live. Maintaining that membership cheaply enough for the park path
-  is not designed, and it is the case where a scan may beat a traversal
-  after all.
-- **Whether the confirmation pass needs to be a snapshot.** Two passes
-  over a moving system can both succeed while the set changed between
-  them in a way neither observed. No scenario has been constructed where
-  this yields a false positive, and none has been ruled out either.
+- **The threshold.** A deployment parameter with no measurement.
+- **Correctness of consumer-supplied posters.** A mutex or channel built
+  by the consumer over the C ABI must keep its resource slot's owner field
+  truthful, and "never invents a deadlock" rests on that. The contract is
+  named here and its enforcement is not designed.
+- **Repeated searches on a stuck set with no failable member.** Every
+  expiry re-detects it. A suppression window per set is the obvious
+  answer; the claim word is probably where it lives.
+- **Watchdogs on long healthy waits.** A mutex held legitimately for
+  longer than the threshold arms a search that finds nothing, repeatedly.
+  Whether the threshold alone is enough, or holders need to extend it, is
+  not decided.
+- **Report lifetime.** A report outlives the units it names, so the slots
+  it points at may be reused before a consumer reads it. Copying the
+  identities into the report is the obvious fix and costs a variable-size
+  allocation the pools do not currently offer.
