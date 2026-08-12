@@ -1,12 +1,12 @@
 # PLAN
 
-Updated: 2026-08-12 · Active: S1
+Updated: 2026-08-12 · Active: S2
 
 A document closes when it answers its own question without reference to
 the conversation it came from, and when every cross-reference in it
 resolves.
 
-## S1 — Repository skeleton  [in progress]
+## S1 — Repository skeleton  [done]
 
 Goal: a fresh session can start from the repository instead of from the
 conversation.
@@ -29,12 +29,12 @@ order and the step the work continues from.
         and tracking origin. The reactor is being split out; where the
         split lands (crate or repository) is not yet settled.
 
-## S2 — Foundations  [ ]
+## S2 — Foundations  [in progress]
 
 Goal: the execution unit is specified before anything is built on it.
 Done when: S3 and S4 can be written without reopening any question in S2.
 
-- [~] S2.1 `design/execution.md`
+- [x] S2.1 `design/execution.md`
       done: the document states what a unit is, how the two coroutine
         kinds share one handle, and what happens at mount and unmount,
         including the TLS rule across a suspension point
@@ -54,6 +54,25 @@ Done when: S3 and S4 can be written without reopening any question in S2.
         queue). And it left the poll ABI the Limelight compiler owes the
         substrate unnamed, which `pool.md` would have had to invent.
         Accepted in full; outline rewritten from ten sections to thirteen.
+      Critic 2026-08-12 round 2, on the written text: eighteen findings,
+        five high, and the parking protocol was wrong as written. A waker
+        finding `Running` had no legal move, so a reply that arrived
+        before the suspension was lost; the fix orders the protocol —
+        state first, record second, arm third — which makes `Running`
+        unreachable for a waker. `Parked` was published by the unit, which
+        announces a context still being saved; the worker publishes it
+        now, after the switch. AND waits could not terminate, because no
+        waker was allowed to write the record; wakers now decrement a
+        counter. A retired loser of an OR wait could wake the unit out of
+        an unrelated wait; every waker validates the epoch first. Results
+        had no channel at all. Accepted in full; the protocol sections
+        were rewritten and "Waking" added as a section of its own.
+      handoff: design/execution.md, 15 sections. The parking protocol is
+        the load-bearing part: four states, every transition a CAS, the
+        order state→record→arm, and `Parked` published by the worker.
+        Exactly one enqueue per wake, decided by that CAS. Open and owed
+        to another repo: mark termination waits on the slowest parked
+        operation, which belongs in rfc/BACKLOG.md and is not there.
 - [ ] S2.2 `design/switching.md`
       done: the document states which registers a switch saves in each
         of the two cases, how the live-register mask reaches the switch,
