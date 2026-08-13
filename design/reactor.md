@@ -149,7 +149,8 @@ after writing the cell, both on the one thread that owns the slot, so
 whichever runs second sees the other's first half. A unit's own remote
 re-read would order nothing, because it precedes the publish it exists to
 defend. The intake queue carrying the publish is one more consumer of the
-ordering contract this document still owes for that queue.
+ordering contract the scheduler owes for that queue (`dev/DECISIONS.md`,
+2026-08-13): the queue is `sched`'s, and this document posts into it.
 
 **The series ends routinely, and the reactor re-arms it.** Multishot
 terminates when the provided-buffer ring runs dry with `-ENOBUFS` and when

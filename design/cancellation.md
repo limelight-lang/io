@@ -74,7 +74,7 @@ Without these a requester cancels, learns nothing, and repeats itself
 against a unit that will never answer. **The detector is not one of those
 requesters**: it reads the foreign-frame count while it walks and never
 chooses a coroutine whose failure has nowhere to surface, and what it sends
-is a conditional resolution to the owner's reactor rather than a request
+is a conditional resolution into the owner's intake queue rather than a request
 whose answer it waits for (`design/deadlock.md`).
 
 **A cross-thread request carries a promise, and the worker that applies it

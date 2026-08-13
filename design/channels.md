@@ -404,7 +404,7 @@ A shared channel is the only kind that crosses. The value is in the buffer
 before any wake exists, and the wake goes inline if the waiter belongs to this
 thread and to the owner's intake queue otherwise, because a coroutine is touched
 only by its own thread (`design/execution.md`); the intake queue itself is
-`design/reactor.md`'s.
+the scheduler's (`dev/DECISIONS.md`, 2026-08-13).
 
 **A same-thread send applies the wake inline** rather than posting to its own
 intake queue, which also keeps the duty on this thread where the walk can
@@ -541,7 +541,7 @@ cross.
 |---|---|
 | how a wait is registered, and the wake protocol | `design/execution.md` |
 | retiring an entry, and cancel while parked | `design/cancellation.md` |
-| the intake queue, and how a worker drains it | `design/reactor.md` |
+| the intake queue, and how a worker drains it | `dev/ARCHITECTURE.md`, `dev/DECISIONS.md` 2026-08-13 |
 | the liveness fixpoint, the served set, resolution by exception | `design/deadlock.md` |
 | what may cross a thread boundary | `rfc/runtime/actors.md` |
 | why a coroutine is touched only by its own thread | `dev/DECISIONS.md`, 2026-08-12 |
@@ -554,8 +554,8 @@ cross.
   registration, and neither is designed. Until one is, a channel whose write
   ends are not all traceable or registered is always live, which costs
   detection for the most ordinary producer there is.
-- **The intake queue's ordering contract** is still owed by
-  `design/reactor.md`, and this document adds to what rests on it: the order in
+- **The intake queue's ordering contract** is still owed by the scheduler
+  (`dev/DECISIONS.md`, 2026-08-13), and this document adds to what rests on it: the order in
   which waiters on different workers are woken, and now a forwarded wake's duty.
   The owner-side re-read above removes the half of the burden that concerned a
   deposit ahead of a resolution; the served set still needs one scan of the

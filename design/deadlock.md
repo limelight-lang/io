@@ -186,7 +186,7 @@ to the unit (`design/pool.md`, `design/reactor.md`).
 **L, the liveness mark.** Roots: globals, the C-ABI registered handle
 table, every coroutine that is neither parked nor `Terminal`, every parked
 coroutine whose wait is already decided (winner claimed or `remaining`
-zero), and every coroutine named by a pending reactor-intake entry whose
+zero), and every coroutine named by a pending intake entry whose
 epoch matches.
 
 A `Terminal` coroutine is excluded because it has finished and still
@@ -378,14 +378,14 @@ record. The epoch alone is not enough, because a waker changes fired bits,
 `Parked`.
 
 **The owner thread confirms before acting.** The collector writes nothing
-into a coroutine. It posts a conditional resolution to the owner's reactor,
+into a coroutine. It posts a conditional resolution into the owner's intake queue,
 and the owner acts only if state, epoch, winner and fired bits still equal
 what was recorded. Every input to deadness except the fired bits and the
 winner is written once per epoch, and those two only grow within one, so
 equality proves the snapshot described this exact wait however stale the
 cross-thread reads were.
 
-The reactor intake queues are scanned once per pass, before the fixpoint. A
+The worker intake queues are scanned once per pass, before the fixpoint. A
 wake posted by a coroutine that has since died leaves the queue entry as
 its only trace, and a pass that misses it fails a coroutine that is owed a
 wake.
@@ -419,7 +419,7 @@ Threads: **K** the collector, **O** an owner thread, **W** any worker.
    record epoch, mode, fired bits, winner, `remaining`, every entry, and
    the foreign-frame count. Recorded in the same visit that carries the M
    mark: a second visit later would mix two states of one record.
-6. **(K)** Scan every reactor intake queue: seed L with the coroutines its
+6. **(K)** Scan every worker intake queue: seed L with the coroutines its
    entries name, and the served set with the resources those entries would
    move — deposits and takes alike. Must precede the fixpoint, for the
    reason above.
@@ -442,10 +442,10 @@ Threads: **K** the collector, **O** an owner thread, **W** any worker.
     channel, stamp the members. Must precede 11: the resumed coroutine
     carries the report handle, and resolved first it would resume pointing
     at a report that does not exist yet.
-11. **(K)** Post to each target's owner reactor a conditional resolution
+11. **(K)** Post into each target's owner's intake queue a conditional resolution
     carrying the coroutine reference, the epoch, the fired bits, the error
     value and the report handle.
-12. **(O, reactor drain)** If state, epoch, winner and fired bits match — and,
+12. **(O, intake drain)** If state, epoch, winner and fired bits match — and,
     for a supply entry, if the resource's own fields still read as they did:
     store the error and the report handle in the record's own result slot,
     claim the winner with the reserved no-entry value (`design/execution.md`),
@@ -570,9 +570,9 @@ deadlock, and the walk alone for a total freeze.
   `ll-model` requires every counted in-edge enumerated per object, the
   cell's reference is enumerated at the unit's own record — one in-edge per
   outstanding entry naming a pooled resource.
-- **The intake queue's ordering contract is owed by `design/reactor.md`**,
-  which today describes the queue as carrying cross-thread cancels and
-  migrated submissions and says nothing about order. Step 12 and the served
+- **The intake queue's ordering contract is owed by the scheduler**
+  (`dev/DECISIONS.md`, 2026-08-13), and no document describes the queue's
+  order yet. Step 12 and the served
   set both rest on one queue per worker drained in order, so a priority
   lane for cancels — an optimization that document's own motivation invites
   — would fail a healthy waiter.

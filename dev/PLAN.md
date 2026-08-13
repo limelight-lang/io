@@ -238,10 +238,40 @@ design document describes machinery that has been retired.
         cell instead. Three `dev/DECISIONS.md` entries of 2026-08-13 carry the
         rulings, the third striking a sentence of the first. Nothing is
         committed: the working tree holds all of it.
-- [ ] S5.4 `dev/ARCHITECTURE.md` from provisional to real
+- [x] S5.4 `dev/ARCHITECTURE.md` from provisional to real
       done: every module row names its files, its public types and what
         crosses its boundary; no row rests on retired machinery
-      tier: T2 · role: Critic
+      tier: T2 · role: Critic → Sage
+      Critic 2026-08-13 round 1: 32 findings, five critical. The intake
+        queue was given to `io-reactor` and then drained, written and read
+        by three `io-core` modules; `unit` held `park` and `wake`, whose
+        steps name the scheduler, the channels and the reactor; the
+        detector's row denied depending on `pool` while naming pool code;
+        "everything crossing a thread boundary" was refuted by the same
+        file three lines down. Timer wheel, diagnostic dump, C-ABI handle
+        table, actor header, `io-api` and the file-I/O thread pool had no
+        owner at all.
+      Sage 2026-08-13: the intake queue is `sched`'s, whole, in `io-core`,
+        an entry being a declaration and an applier; what crosses the crate
+        line instead is the worker driver. `park` and `wake` are `sched`'s
+        exports and `unit` keeps the record mechanics, split by step. `sync`
+        is a module of `io-core` and supersedes the 2026-08-12 module list.
+        Final.
+      Critic 2026-08-13 round 2: 22 more, two critical, and both hit the
+        same device — the strict level table, which by then had been wrong
+        three times. The detector roots its liveness mark in a table
+        `io-api` owns; the watchdog's arming rule runs on the park path.
+        Rather than defend it a third time the levels were replaced by a
+        call graph with two other kinds of edge named beside it: an
+        installed callable and a read of a root.
+      handoff: `dev/ARCHITECTURE.md` is nine modules and the API crate, a
+        section each, and the ruling behind its boundaries is in
+        `dev/DECISIONS.md` of 2026-08-13. Four opaque callables are the only
+        things that cross a level or a crate line: the cancel handle, the
+        worker driver, `sync`'s duty hook, the detector's arming predicate.
+        Three modules have no design document and `dev/INDEX.md` now says
+        which — the scheduler, the synchronisation primitives, the timer
+        wheel — plus the whole C-ABI surface.
 - [ ] S5.5 PlantUML in `dev/design/`: parking, submission and completion,
       the object lifecycle
       done: the parking diagram matches the numbered protocol in

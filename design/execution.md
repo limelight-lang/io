@@ -17,7 +17,7 @@ stack and machine registers are a separate pooled object rather than part
 of the unit.
 
 **Only its own thread ever touches a unit.** A signal from another thread
-is delivered to that thread's reactor, which runs there and touches the
+is delivered to that thread's intake queue, drained there, and touches the
 unit on its behalf. This invariant is what the parking protocol below is
 written against, and it is why that protocol needs no atomic operation.
 
@@ -558,7 +558,7 @@ and `released` is the free that follows the last reference dropping.
 
 There are three parking states and no fourth. A wake that arrives while the
 unit is still suspending does not exist, because only the unit's own thread
-touches it: the wake is delivered to that thread's reactor and applied
+touches it: the wake is delivered to that thread's intake queue and applied
 after the unit is `Parked` (`dev/DECISIONS.md`, 2026-08-12). `Parked →
 Woken` is enqueued by the waker, re-enters `Running` through the run
 queue, and teardown is reached only from `Running`.
@@ -610,7 +610,7 @@ decided test does not.
 
 The bit is a modifier on the transitions that already exist, not a state
 of its own. It is set by the unit's own thread, because a cancel raised
-elsewhere reaches that thread's reactor first.
+elsewhere reaches that thread's intake queue first.
 
 ### A unit always ends itself
 

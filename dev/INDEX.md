@@ -57,6 +57,19 @@ Written in the order below; each is listed here once it exists.
 
 - `dev/BENCHMARKS.md` — no code to measure yet.
 - `CHANGELOG.md` — nothing released.
-- The ordering contract of the reactor's intake queue. `design/reactor.md`
-  describes the queue without it, and `design/deadlock.md` rests on one
-  queue per worker drained in order.
+- The ordering contract of the worker intake queue, owed by the scheduler
+  (`DECISIONS.md`, 2026-08-13). `design/deadlock.md` rests on one queue per
+  worker drained in order, and no document states that order.
+- A design document for the mutex, the join and the semaphore.
+  `design/deadlock.md` owns their liveness rules and `design/channels.md`
+  the semaphore's API; the primitives themselves have no document.
+- A design document for the scheduler. The ready set, the private lists,
+  the intake queue, the worker's turn and the readiness word are decided
+  in `DECISIONS.md` of 2026-08-13 and described in no `design/` file, which
+  is why the queue's ordering contract has nowhere to be written.
+- The timer wheel. Three documents rest on it — the watchdog, the arming of
+  a timeout, the removal at retirement — and it is one of the three memory
+  roots, but `design/reactor.md` does not describe it.
+- The C-ABI surface: the registered handle table with its register and
+  unregister calls, the death notification for a unit ended by a stack
+  overflow, and how a foreign holder dropping a write end becomes visible.

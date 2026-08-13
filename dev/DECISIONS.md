@@ -1350,3 +1350,79 @@ until the C++ layer follows it, so the upgrade is one change to three
 things at once. That is the price of linking bitcode from two compilers,
 and the alternative — letting rustc float — buys nothing, because the
 LLVM it drags along is not ours to choose.
+
+## 2026-08-13 — Module boundaries: the intake queue, the cut through park and wake, and a ninth module
+
+Supersedes the module list of the crate entry of 2026-08-12, which named
+`io-core` as unit, switch, stack, sched, pool and deadlock. It is now unit,
+switch, stack, sched, pool, **sync**, deadlock and the unit half of cancel.
+Sage's ruling on three boundary questions a Critic round raised against
+`dev/ARCHITECTURE.md`; executed as written.
+
+**The intake queue belongs to `sched`, whole, in `io-core`.** Five of its
+six users are `io-core` modules, its element vocabulary is `io-core`'s
+throughout — unit references, epochs, entry indices, resources, promises,
+resolutions — and `sched` drains it every turn while the nothing-to-do
+predicate reads its emptiness and the detector's pass enumerates its
+entries. A structure whose type, drain, predicate, scan and roots are all
+`io-core`'s is an `io-core` structure. Rejected: reactor ownership with an
+installed post callback, on the shape of the cancel handle. A callback is a
+blind call, and this queue is not blindly called.
+
+**An entry is a declaration and an applier.** The declaration is what any
+reader sees without knowing the poster: the counted cells the entry holds,
+which is what makes the queue a memory root; the unit and epoch it names,
+or none, which seeds the liveness mark; the resource it would move, or
+none, which feeds the served set — and that field is the same field a
+forwarded supply wake's payload already carries, not a second one. The
+applier is installed by the poster and run at the drain, in arrival order,
+with `sched` looking behind none of them.
+
+**What crosses the crate line instead is the worker driver.** `sched`
+defines it — flush submissions, drain completions, sleep until the waker
+rings, arm and remove a timer-wheel entry — and `io-reactor` implements it
+per worker. Ringing a sleeper goes through its waker. With the cancel
+handle and `sync`'s duty hook this makes three crossings of one shape: the
+module that knows installs an opaque callable, and the module that holds
+the boundary invokes it. The detector's watchdog reaches the timer wheel
+the same way, or it is the forbidden edge under another name.
+
+**The ordering contract of the intake queue is `sched`'s debt now**, not
+`design/reactor.md`'s: one queue per worker, drained in arrival order
+across producers, with resolutions and deposits in the same queue, because
+`design/deadlock.md`'s step 12 and the served set rest on it. What the
+structure costs is the same open question it was.
+
+**`park` and `wake` are `sched`'s exports; `unit` keeps the record
+mechanics.** `design/execution.md` still specifies both protocols whole,
+and the split is by step. Dispatch, the enqueue, the move path with its
+four conditions, and the ring of a sleeper are `sched`'s. The epoch test,
+the result store, the decidedness test, the claim, retirement through
+opaque handles and the suspension itself are `unit`'s. Each entry is armed
+by its resource's module, which installs the cancel handle. The owner half
+of a declaring actor's wider word is opaque to `unit`: it stores the tag
+`sched` passes and resolves nothing, which is how it carries `Running(W)`
+without naming a worker. Rejected: inverting the two, so that `unit` sits
+above `sched`. The mounting compare-exchange, the ready-set entry's
+disambiguation and the delivery rule are written in the state word's
+vocabulary; inverting would hide that vocabulary behind a trait and move
+no knowledge at all.
+
+**`sync` is a module of its own because every candidate absorber is
+forbidden a piece of it**: `unit` must not know what a channel is, `sched`
+must not either, S5.3 severed these objects from `pool`, and `deadlock`
+reads observables and nothing behind them. It is in `io-core` because the
+detector is, and reads occupancy, both end counts and the flags off these
+resources; and because a consumer that compiles no backend still gets
+channels, futures, mutexes, joins and semaphores. The debtor's owner field
+is `sync`'s to keep truthful and `deadlock`'s to mark: the memory mark
+traces it, the liveness mark stops at it, the attribution walk does not
+cross it. A design document for the mutex, the join and the semaphore is
+still owed; the actor mailbox stays the open row it is in
+`design/deadlock.md` and `sync` does not take it.
+
+Struck by this entry: `design/channels.md`'s "the intake queue itself is
+`design/reactor.md`'s"; `design/reactor.md`'s claim to owe that queue's
+ordering contract; the same debtor in `design/deadlock.md`'s open questions
+and in `dev/INDEX.md`. Every "reactor intake queue" in the design documents
+is a worker intake queue; superseded entries here keep their wording.
