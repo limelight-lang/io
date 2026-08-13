@@ -146,14 +146,25 @@ stores and the wake that could once arrive mid-suspension cannot.
 3. **Suspend.** A stackful unit switches to the worker. A stackless unit
    returns `Pending` from `poll`.
 4. **Mark `Parked`.** After the switch has completed, or after `poll` has
-   returned, the worker stores `Parked`. It is the worker rather than the
+   returned, the worker stores `Parked` — unless the cancelled bit is set, in
+   which case it retires the entries, stores `Woken` and enqueues instead
+   (`design/cancellation.md`). Retiring there is what unlinks the nodes this
+   wait put into resource queues; a unit that leaves them behind is a channel
+   waking a coroutine that has since parked on something else. It is the worker rather than the
    unit because a unit that announced itself parked while its machine
    context was still being saved would be resumable before it was
    savable, which is a bug even on one thread.
 
 If an entry completed inline during step 2 — the reactor's submission
 returned a result at once, the mailbox already held the reply — the unit
-does not suspend at all: step 3 is skipped and it continues.
+does not suspend at all: step 3 is skipped and it continues. **When an inline
+satisfaction ends the wait, it retires every entry armed before it, its own
+included** — under OR mode, and under AND when it was the last outstanding
+entry. Leaving one armed would leave a resource holding a waiter for a wait that
+no longer exists, and the wake it later sends is dropped on the epoch without
+anyone else being woken (`design/channels.md`). **Under AND with entries still
+outstanding nothing is retired and the unit suspends as usual**: retiring there
+would leave the wait alive with nothing able to end it.
 
 Nothing else in the system may register a wait. A wait recorded outside
 this primitive is invisible to the deadlock detector, and its absence is
@@ -256,6 +267,15 @@ than the unit. It does five things in order, behind one dispatch.
 Steps 1 through 4 are what make wakes safe to repeat. Step 5 is what
 makes them arrive exactly once, and step 0 is what makes them safe to deliver
 to a unit that has changed threads.
+
+**`wake`'s answer is three-valued: accepted, refused, forwarded**, because a
+caller holding the only news has to know where that news went. Refused, at step
+0, 1 or 3 on this thread, means this unit carries it nowhere and a supply
+resource must try the next waiter itself. Forwarded means the payload went to
+another worker's intake queue and the obligation travelled with it, which is why
+a supply wake's payload names the resource: the owner learns the refusal and
+re-runs the wake there (`design/channels.md`). A resource that names an owner
+has nothing to hand on and ignores the answer.
 
 ## The wait record
 

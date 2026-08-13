@@ -60,8 +60,9 @@ The kind decides the liveness rule and nothing else about a resource does.
   no answer.
 
 The semaphore falls on the line, so where it falls is decided by its API
-rather than by its name. A permit released only by dropping a guard ties
-release to acquisition, which is what makes a holder a debtor. A semaphore
+rather than by its name; `design/channels.md` fixes that API and gives the
+substrate's own semaphore no bare post. A permit released only by dropping a
+guard ties release to acquisition, which is what makes a holder a debtor. A semaphore
 with a post that anyone may call — `sem_post`, `ReleaseSemaphore`, Java's
 `release`, and every semaphore reached over the C ABI, whose discipline we
 cannot see — has no such tie: a semaphore created with zero permits and
@@ -69,10 +70,25 @@ posted by a producer that never acquired anything has no holders at all,
 and classifying it as a debtor would report its waiter as deadlocked while
 the producer is running.
 
-A supply resource imposes one constraint on its own object model: its ends
+A supply resource imposes one constraint on its own object model, and
+`design/channels.md` carries it as a rule for the implementation: its ends
 are reachable from their holders and the resource is reachable from its
 ends, and there is no traced reference the other way. A count of live ends
-is fine; a reference is not. With a back-reference, any live holder of the
+is fine; a reference is not.
+
+**Its queues of waiters are counted and traced, and two walks skip them**, and
+this half is as load-bearing as the first. The link has to be counted, because
+whoever arms an entry holds a reference so that a unit cannot be freed under a
+wake still on its way, and it has to be traced, because a counted reference the
+tracer cannot enumerate is unsound in this memory model. What it must not do is
+conduct L: the flow rule below stops L leaving the cells of a parked coroutine
+and does not stop it entering the coroutine object, so one live holder of a read
+end would otherwise mark every coroutine parked on that resource and none could
+enter the dead set. The attribution walk skips the same links, or a dead
+coroutine holding a read end reaches other coroutines' write ends through the
+queue, the dead graph gains edges that do not exist, and a victim is chosen from
+a distorted set of sinks. `design/channels.md` states what an implementer checks
+at each enqueue and unlink. With a back-reference, any live holder of the
 read end makes the write end reachable through the resource, every channel
 with a live receiver reads as servable, and supply resources stop being
 detectable at all.
@@ -148,8 +164,13 @@ table, every coroutine that is not parked, every parked coroutine whose
 wait is already decided (winner claimed or `remaining` zero), and every
 coroutine named by a pending reactor-intake entry whose epoch matches.
 
-L flows through every object except that it does not flow out of the cells
-of a parked coroutine that is not itself L-marked.
+L flows through every object except two. It does not flow out of the cells
+of a parked coroutine that is not itself L-marked, and it does not flow
+through the waiter-queue links of a supply resource; the attribution walk
+does not cross those links either. Both links are counted references and
+the memory mark traces them like any other, because a counted reference the
+tracer cannot enumerate is unsound here — an untraced queue could never
+have carried a counted one.
 
 **Beside the marks the pass collects the served set**, which is not a mark
 and does not propagate: a resource is *served* when a pending intake entry
@@ -198,6 +219,14 @@ An outstanding entry is live when:
 | channel receive | the buffer is non-empty, or the channel is served, or the channel is closed, or the write end is L-marked |
 | channel send | the buffer has space, or the channel is served by a pending take, or the channel is closed, or the read end is L-marked |
 | future await | it is resolved or broken, or the future is served, or the promise is L-marked |
+
+**Closed** is read as the closed flag or the relevant end count at zero —
+write ends for a receive or an await, read ends for a send
+(`design/channels.md`). The decrement that reaches zero is the moment the
+resource becomes closed, so the window between it and the flag store is read
+as closed rather than as a resource with no reachable write end, which is
+what would otherwise report an invented deadlock against an ordinary
+producer's exit.
 
 A coroutine in **OR** mode is live when any outstanding entry is live; in
 **AND** mode when every outstanding entry is live.
@@ -346,9 +375,15 @@ Threads: **K** the collector, **O** an owner thread, **W** any worker.
    reason above.
 7. **(K)** Seed the remaining L roots and run the fixpoint. Empty dead set
    ends the detector's part; the memory work continues either way.
-8. **(K, re-read phase)** Validate every dead member. Must sit behind the
-   collector's phase fence: a re-read servable from the same instant as the
-   first read validates nothing.
+8. **(K, re-read phase)** Validate every dead member, and for a supply entry
+   validate the resource fields the verdict consumed as well: occupancy, the
+   closed and broken flags, both end counts, a future's resolved state. Any
+   movement drops the whole weakly-connected component, exactly as a movement
+   of a record does. Must sit behind the collector's phase fence: a re-read
+   servable from the same instant as the first read validates nothing. Without
+   the resource half, a write-end count reaching zero inside the pass survives
+   validation and the report published at step 10 is a lie even under
+   `report-only`.
 9. **(K)** Run the attribution walks, build the dead graph, compute the
    sinks, choose one target per sink, skip sets whose members all carry a
    current report stamp. Must follow 8, or a target is chosen from a set
@@ -360,9 +395,13 @@ Threads: **K** the collector, **O** an owner thread, **W** any worker.
 11. **(K)** Post to each target's owner reactor a conditional resolution
     carrying the coroutine reference, the epoch, the fired bits, the error
     value and the report handle.
-12. **(O, reactor drain)** If state, epoch, winner and fired bits match:
+12. **(O, reactor drain)** If state, epoch, winner and fired bits match — and,
+    for a supply entry, if the resource's own fields still read as they did:
     store the error as the result, claim the wait as decided, retire every
     outstanding entry through its cancel handle, store `Woken`, enqueue.
+    The owner-side re-read costs one read per resolution, and resolutions are
+    rare; it is what makes a deposit that landed during the pass authoritative
+    over a verdict built on its absence.
     That is the wake protocol's own order, and the state store is last for
     its reason (`design/execution.md`): a coroutine enqueued before its
     result is stored can be picked up by a worker and read a result that
@@ -382,9 +421,9 @@ with no change, and the difference is carried in the error value: a cause
 naming deadlock, and the report handle. A mutex, an actor call and a join
 have no closure to imitate and raise a deadlock error of their own.
 
-**The detector marks no resource.** Resources die by their own rule:
-dropping the last write end closes a channel and breaks a future, waking
-every waiter through the ordinary path. That covers the co-waiters without
+**The detector marks no resource.** Resources die by their own rule, and
+`design/channels.md` states it: dropping the last write end closes a channel
+and breaks a future, waking every waiter through the ordinary path. That covers the co-waiters without
 a second pass, because the resumed coroutine drops the last write end while
 unwinding. A mark placed by the detector would be wrong in the one case
 that matters — a write end still held by members of the dead set, where
@@ -471,12 +510,6 @@ deadlock, and the walk alone for a total freeze.
   `run_epoch` and the steppable collector. The fallback is a detector-owned
   second traversal of parked coroutines inside the same pass, which changes
   this document's cost section and not its protocol.
-- **Closing on the drop of the last write end** is channel and future
-  semantics, and this document depends on it while no document defines it.
-  The object-model constraint above belongs there too, and so does the
-  substrate semaphore's release API: this document's debtor branch holds
-  only if a permit is released by dropping a guard, which constrains an
-  API that is not designed yet.
 - **The intake queue's ordering contract is owed by `design/reactor.md`**,
   which today describes the queue as carrying cross-thread cancels and
   migrated submissions and says nothing about order. Step 12 and the served
@@ -495,6 +528,24 @@ deadlock, and the walk alone for a total freeze.
   intake queue is empty; or have the owner re-read the resource before
   applying a resolution, which costs one read per resolution and makes the
   order irrelevant.
+- **A write end the tracer cannot reach is indistinguishable from one that no
+  longer exists**, and this is a hole rather than a caveat. Attribution walks
+  the cells of a coroutine, which the `walk` hook makes reachable; a write end
+  in a *frame* of a stackful coroutine is in no cell, no document here designs
+  enumerating references out of a coroutine's stack, and for a frame someone
+  else compiled it cannot be done. A producer that computes for a while with
+  the write end in a local variable therefore reads as unreachable, and its
+  healthy receiver is failed with an invented deadlock. Two closures exist and
+  neither is designed: stack maps from `ll-model`, or registration of such an
+  end as a C-ABI holder's is registered. Until one lands, a resource whose
+  write ends are not all traceable or registered has to be treated as always
+  live, which costs detection for the most ordinary producer there is.
+- **A wait on an actor's mailbox has no row.** The kinds above list the mailbox
+  as a supply resource, and the table has a row for a synchronous actor call,
+  which is a debtor. A coroutine waiting for a message of its own — an actor
+  reading its mailbox — is neither, and nothing here says when that wait is
+  live. The observables exist: the readiness word and the queued count
+  (`dev/DECISIONS.md`, 2026-08-13). The row does not.
 - **The threshold.** A deployment parameter with no measurement.
 - **Correctness of consumer-supplied resources.** A mutex or channel built
   over the C ABI must keep its owner field truthful and its write ends in

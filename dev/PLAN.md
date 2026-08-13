@@ -136,12 +136,65 @@ design document describes machinery that has been retired.
         `design/deadlock.md`'s actor-call row now reads the readiness word.
         `crossbeam-deque` is out of the toolchain and `dev/DECISIONS.md` of
         2026-08-12 keeps it only as the superseded choice.
-- [ ] S5.2 Channels and futures get a document that owns their semantics
+- [x] S5.2 Channels and futures get a document that owns their semantics
       done: closing on the drop of the last write end is defined there,
         the ends reference the resource while the resource holds no traced
         reference back to them, and `design/deadlock.md` cites both
         instead of assuming them
-      tier: T2 · role: Critic
+      tier: T2 · role: Critic → Sage
+      Edmond 2026-08-13: two kinds of channel as in TrueAsync, because a
+        channel across threads is a different algorithm.
+      Critic 2026-08-13 round 1: eighteen findings, all accepted. The two that
+        were corpus-level: a write end in a stackful frame is reachable by
+        nothing, since the `walk` hook covers a coroutine's cells and no
+        document enumerates its stack, so a healthy receiver is failed while
+        its producer merely holds the end in a local; and the channel's waiter
+        queue is a traced edge into a parked coroutine, so the liveness mark
+        flows in and no channel waiter ever enters the dead set, with scope
+        binding making every channel L-reachable. Also: no ordering rule
+        between arming and depositing, a refused wake absorbed, a non-blocking
+        rendezvous send with nowhere to put its value, arm-time satisfaction
+        breaking the FIFO contract and resetting timeouts, a thread-local end
+        in a migrating actor's hands, a miscitation of `rfc/runtime/actors.md`
+        that admitted an arena-born value into a shared channel.
+      Critic 2026-08-13 round 2: seventeen more, five critical. The node of an
+        entry satisfied inline was never unlinked, which poisons the queue on
+        every fast-path receive; retiring "everything armed earlier" is wrong
+        under AND and strands the wait; a cancel found in `Running` and every
+        park under final cancellation leave nodes armed into teardown; an
+        *accepted* wake is swallowed by a waiter cancelled before it consumes;
+        and the one lock is either held across `wake`, whose retirement takes
+        other channels' locks and deadlocks two workers ABBA, or the walk is
+        not a walk. Plus two of mine: `deadlock` as a fifth close cause is the
+        resource mark `deadlock.md` forbids, and the end count reaching zero
+        before the closed flag invents a deadlock on an ordinary producer exit.
+      Sage 2026-08-13: the queue link stays counted and traced — an untraced
+        counted reference is unsound in this memory model — and the isolation
+        is a flow rule instead: L does not flow through a supply resource's
+        waiter links, and the attribution walk does not cross them either, the
+        second half being mine to have missed, since without it a dead
+        coroutine reaches other write ends through the queue and the victim is
+        chosen from a distorted graph. The walk-until-accepted rule is replaced
+        by conservation of duty: a supply wake is discharged only by
+        consumption, and each of the three carriers — inline refusal, a
+        refusal learned on another worker, an accepted wake never consumed —
+        names who re-runs it, which is why a supply wake's intake payload now
+        carries the resource. The channel's lock is a leaf: nothing foreign
+        runs under it, `wake` never does, and "link then test" is replaced by
+        one decide-and-publish section. A detector verdict does not close a
+        channel; the cause lives in the error. The count-versus-flag race is
+        closed by reading closedness as "flag or end count at zero" and by
+        extending the validation and the owner-side check to the resource's
+        own fields. Final; executed as written.
+      handoff: `design/channels.md` is the third version and the one that
+        stands. It changed `design/deadlock.md` (the supply constraint's second
+        half, the L and attribution flow rule, closedness, steps 8 and 12, and
+        a new open item for the mailbox row that no document owns),
+        `design/execution.md` (inline satisfaction and AND, the three-valued
+        `wake`, the cancelled bit at park step 4) and `design/cancellation.md`
+        (the channel row, with duty discharge). Two holes stay open by name: a
+        write end the tracer cannot reach, and the intake queue's ordering
+        contract.
 - [ ] S5.3 Apply the remaining corrections listed in `dev/INDEX.md`
       done: the corrections table in `dev/INDEX.md` is empty and deleted,
         and the wait epoch has one rule instead of the three documents'

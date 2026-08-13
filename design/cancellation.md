@@ -91,6 +91,13 @@ on what armed it:
 - **A timer** is removed from the wheel. Synchronous.
 - **A message to another actor** is marked so the reply is discarded on
   arrival. There is nothing to recall.
+- **A channel or a future** has its waiter node unlinked from the resource's
+  queue, under that resource's lock, and any wake the node had already accepted
+  is re-run for the next waiter before the cancel propagates. Synchronous,
+  local, idempotent — unlink if linked — and it cannot fail. Unlinking is an
+  obligation rather than a courtesy: a node left behind wakes a coroutine that
+  has since parked elsewhere, and the wake it absorbed is the only thing that
+  told anyone a value was there (`design/channels.md`).
 - **A kernel operation** is two phases, below.
 
 **Retirement is asynchronous and a retired entry may still fire.** Two

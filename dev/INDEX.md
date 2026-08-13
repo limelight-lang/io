@@ -67,6 +67,7 @@ Written in the order below; each is listed here once it exists.
 | `design/reactor.md` | the completion-first API, the three buffer contracts, the four backends |
 | `design/cancellation.md` | cancellation and two-phase teardown while the kernel still owns a buffer |
 | `design/deadlock.md` | the liveness fixpoint inside the collector's walk, the three resource kinds, soft resolution by exception |
+| `design/channels.md` | channels and futures: the two kinds and why they are two algorithms, the ends and the reachability constraint, closing and breaking, what a wake does not carry, the semaphore's release API |
 
 ## Related repositories
 
@@ -80,10 +81,6 @@ Written in the order below; each is listed here once it exists.
 
 - `dev/BENCHMARKS.md` — no code to measure yet.
 - `CHANGELOG.md` — nothing released.
-- A document for channels and futures. `design/deadlock.md` depends on
-  their semantics — dropping the last write end closes a channel and
-  breaks a future, and no traced reference runs from the resource back to
-  its ends — and nothing defines them.
 - The ordering contract of the reactor's intake queue. `design/reactor.md`
   describes the queue without it, and `design/deadlock.md` rests on one
   queue per worker drained in order.
