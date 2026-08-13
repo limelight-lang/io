@@ -77,6 +77,65 @@ design document describes machinery that has been retired.
         walk, two mark bits, three resource kinds, one victim per sink
         SCC, owner-thread confirmation before anything is written.
         `half` is renamed `entry` across five design documents.
+- [x] S5.8 The actor run queue and its stealing, researched and decided
+      done: `dev/DECISIONS.md` carries an entry naming the chosen
+        structure, every candidate it beat and the property it beat them
+        on, and what stays unmeasured until there is code
+      tier: T2 · role: Critic
+      Edmond 2026-08-13: `crossbeam-deque` was taken, never compared, so
+        it is not final. A pinned coroutine's queue is a classic ring
+        buffer and is not part of this question — only the actor queue is.
+      Runs before S5.2 because `dev/ARCHITECTURE.md` (S5.4) names the
+        scheduler's types and cannot be written around an open dependency.
+      Critic 2026-08-13 round 1: nine high findings, four of them
+        structural — an idle actor has no unit, so nothing arbitrated its
+        placement and neither the one-enqueue invariant nor the foreign-frame
+        counter applied; the movability vet was available only where the
+        decision was already local; a shed lane per owner restored the O(N)
+        foreign scan that stealing was rejected for; and filling a lane at a
+        turn boundary tied the offload rate to the busiest worker's boundary
+        rate. Accepted; the entry was rewritten around one shared ready set.
+      Critic 2026-08-13 round 2: five critical. The mounting transitions of
+        the actor's readiness word were missing, so an actor could run on two
+        workers at once; forwarding a wake to a unit that moved mid-message
+        races on the wait record and terminates only under a claim, which
+        costs an atomic per wake; the handshake answer treated the
+        woken-mid-message list as consistent, which `design/execution.md`
+        denies; nothing rings a sleeping worker when an actor enters the
+        ready set; and the actor-call liveness rule of `design/deadlock.md`
+        reads no field that is true between taking a message and mounting
+        it, so a healthy synchronous call is reported deadlocked. Fixes in
+        hand; the price of a mid-message move goes back to Edmond.
+      Edmond 2026-08-13: pay the price only for actors that declare
+        mid-message movement, and at most one move per message.
+      Sage 2026-08-13: the claim is not a lock a forward holds — that would
+        block mounting on another thread's progress. It is the unit's state
+        word widened for a declared actor to `Running(W)`, `Parked(W)`,
+        `WokenLocal(W)`, `WokenShared`, `Terminal`, with the cancelled bit
+        moved to a byte beside it; any thread holding a signal reads the word
+        once and either applies it, forwards it to the named worker, or drops
+        it. Termination comes from Edmond's one-move limit, not from the
+        claim: the owner chain within one message is at most two long. No hole
+        in the limit, because a move happens only through a wake and a wake
+        only on a decided wait, so a moved unit has no outstanding entries.
+        Root the memory mark in the scheduler's ownership table and in no
+        queue — the table is a lifetime registry a move never touches — under
+        four queue invariants, which also repairs a defect of mine: the entry
+        had named every private list a root, and those are non-atomic
+        single-owner lists no foreign thread may read. Also refused the
+        Critic's two alternatives: no second inbound queue, and no ban on
+        moving with foreign-armed entries. Final; executed as written, with
+        `design/execution.md` owing the statement that `Woken` means the wait
+        is decided, and actor creation owing the rejection of a declaration
+        paired with opting out of the counter.
+      handoff: three entries in `dev/DECISIONS.md` of 2026-08-13 carry it —
+        re-mounting and its price with the claim protocol, the wait epoch, and
+        the scheduling structure. `design/execution.md` gained dispatch as
+        step 0 of `wake`, the split step 5, the widened word for a declaring
+        actor, the mounting compare-exchange and the `Woken` equivalence;
+        `design/deadlock.md`'s actor-call row now reads the readiness word.
+        `crossbeam-deque` is out of the toolchain and `dev/DECISIONS.md` of
+        2026-08-12 keeps it only as the superseded choice.
 - [ ] S5.2 Channels and futures get a document that owns their semantics
       done: closing on the drop of the last write end is defined there,
         the ends reference the resource while the resource holds no traced

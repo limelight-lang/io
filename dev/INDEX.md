@@ -42,13 +42,11 @@ and `dev/DECISIONS.md` of that date is what holds where they disagree:
 `design/deadlock.md` are already corrected. Applying the rest belongs to
 the architecture stage.
 
-One question has to be settled while applying them, because three
-documents give two answers: **when the wait epoch moves.**
-`design/cancellation.md` bumps it when a wait ends, `design/pool.md` moves
-it only at the next park, and the wake protocol in `design/execution.md`
-has no bump step at all. The detector's confirmation on the owner thread
-(`design/deadlock.md`, step 12) compares the epoch, so the answer is an
-input to its correctness and not a detail of wording.
+**When the wait epoch moves is settled** (`dev/DECISIONS.md`, 2026-08-13):
+it is written once, in step 1 of the parking protocol, and no path that
+ends a wait touches it. `design/cancellation.md` and `design/execution.md`
+are corrected; `design/pool.md` already agreed, and its unit-walking
+section goes with the retirements above.
 
 **`half` is renamed `entry`** (`dev/DECISIONS.md`, 2026-08-12): one entry
 of the wait record per thing a coroutine waits on. Renamed in

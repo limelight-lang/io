@@ -654,3 +654,439 @@ Open:
 - **A live holder that never writes** is undetectable by construction:
   reachability proves possibility, not intent. The diagnostic dump over
   the pools is the tool for that case.
+
+## 2026-08-13 — An actor may be re-mounted anywhere; the difference is price
+
+Decided by Edmond, and it replaces the conservative rule in
+`design/execution.md` that re-mounted an actor only at a message boundary.
+**Every suspension point is a re-mount point. What differs between them is
+what the move has to carry.**
+
+**Between messages the move carries nothing.** The actor has no unit, no
+stack and no saved registers: one message is one unit, created when the
+message is taken from the mailbox and destroyed when it is done. Mounting
+elsewhere installs the arena into that worker's thread-local storage and
+takes the next message. Beyond a cold arena there is no cost at all, which
+makes this the default balancing point.
+
+**Inside a message the move carries the context.** The saved live-register
+set and the live stack travel with the unit, and both are memory, so the
+mechanism is the same handoff with the same release and acquire pair. Two
+costs are real. The cache is one: the stack's hot pages and the arena are
+cold on the new core, and the deeper the frames the more of them are warm.
+The other is that everything already armed points at the previous worker.
+An operation submitted to that worker's ring completes there, a timer sits
+in its wheel, a cross-thread cancel is addressed to its intake queue, and
+the detector addresses a resolution to the owner it recorded. Each becomes
+a forwarding obligation, and `wake` running "on the unit's own thread"
+becomes a claim on a mutable owner field rather than a fact, because
+parking is plain stores precisely on the strength of there being one such
+thread. That is what a mid-message move buys with.
+
+**What it buys is worth the price for our profile.** An actor that parks a
+hundred times on I/O within one message would otherwise be tied to its
+first worker for all hundred resumptions, and it is the resumption, not the
+park, that needs a free core.
+
+**The price is paid only where it was asked for.** Decided by Edmond after a
+Critic round costed it: an actor declares whether it may move mid-message,
+and one that does not moves only between messages and keeps plain stores on
+its own thread. A declaring actor moves at most once per message. The bound
+is what keeps the cost proportional to the benefit, because the profile this
+exists for parks a hundred times inside one message, and a move at every park
+would pay the claim and the shared structure's mutex a hundred times over
+(see the scheduling entry of the same date).
+
+**One veto is absolute and is not a price.** A unit whose foreign-frame
+counter is non-zero does not move at any point. The frames below hold state
+tied to the thread — `errno`, an OpenSSL error queue, a locale handle, a
+foreign allocator's caches — and an OS mutex taken there is owned by the
+thread that took it, so releasing it from another is undefined
+(`design/switching.md`). A unit that opted out of maintaining the counter
+reads as permanently non-zero and therefore never moves.
+
+**What the counter does not cover has to be said in the same breath.** It
+sees nested foreign frames and nothing else. Thread-affine state that a
+library takes in one call and releases in a later one is invisible to it:
+memory handed out from a per-thread allocator cache on one worker and freed on
+another, a `flockfile` and `funlockfile` pair split across two calls, any
+handle a library parks in its own thread-local storage and reuses on the next
+entry. Between those calls the counter reads zero and the unit is free to
+move. `design/execution.md` holds this open under pinning granularity; the
+honest statement is that the veto is exact for what it measures and silent
+about what it cannot see, and that a consumer who knows it keeps such state
+declines the mid-message declaration — the same lever as opting out of the
+counter.
+
+**The claim is the state word, widened — ruled by Sage, and it is not a lock
+a forward holds.** A lock would stall mounting on another thread's progress.
+For a declaring actor the unit's state word becomes one atomic word carrying
+the state and the owner: `Running(W)`, `Parked(W)`, `WokenLocal(W)`,
+`WokenShared`, `Terminal`, with the cancelled bit moved to an atomic byte
+beside it so that mounting needs no compare-exchange loop to preserve it. For
+every other unit the word stays what it is, plain stores with a fixed owner.
+
+**Delivery is one rule, applied by whoever holds a signal** — a completion on
+a foreign ring, a cancel, the detector's resolution — and applied again when
+a worker drains its intake queue. Read the word once, then:
+
+- it names me: apply locally;
+- it names another worker: put the payload in that worker's intake queue and
+  ring its wake descriptor;
+- `WokenShared`: drop a wake and drop a resolution, and write the byte for a
+  cancel. Dropping is correct because `Woken` means the wait is already
+  decided: a wake on a decided wait is a no-op, and step 12 of
+  `design/deadlock.md` requires the state to still be `Parked`. Nobody writes
+  the record in that window;
+- `Terminal`: drop, and release whatever the signal held.
+
+Only the wake's payload travels — the unit, the entry index, the epoch, the
+result. An operation's accounting stays in its slot on the ring that
+submitted it and never moves.
+
+**Against the protocols this changes two steps and adds one.** Dispatch is
+step 0 of `wake`, ahead of the epoch check, so a foreign thread never reads
+the epoch. Steps 1 to 4 are unchanged and stay plain stores, because the
+thread applying them owns the unit. Step 5 splits: locally, store
+`WokenLocal(W)` and enqueue into the worker's own list; on the move path,
+where the actor declared it, the foreign-frame counter is zero and the limit
+is unspent, store-release `WokenShared`, then push to the ready set, then ring
+a sleeper. Word before queue, and after that store the worker touches the unit
+no more — including its own later intake entries about it, which dispatch will
+catch. Mounting is the acquisition: take from the ready set, compare-exchange
+`WokenShared → Running(W')` with acquire semantics, install the arena,
+continue. Parking is untouched except that step 4's store is atomic and the
+word carries the owner; arming always targets the current worker's ring and
+wheel, and the one-move limit resets when a unit is created.
+
+**What weakens, exactly.** "Only the unit's own thread writes the record"
+becomes "only the thread the claim word names writes the record, and handing
+ownership over carries release and acquire" — the same pair that already
+publishes the arena. Inside an ownership window there is one writer; inside
+`WokenShared` there are none. The detector is unaffected: a move requires a
+wake, a wake claims the winner and sets a fired bit, so step 8 or step 12
+discards a finding that predates it, and the next park writes a fresh epoch.
+The served set holds, because forwarding only delays a resolution against a
+deposit and never advances it.
+
+**Cost.** For a declaring actor: an atomic store per transition of the word,
+one compare-exchange when a moved unit is mounted, an atomic byte for cancel.
+For every unit, declared or not: one atomic load and a branch each time an
+intake entry is applied. For a signal that lost the race against a move: one
+scheduler turn of extra latency. For everyone else: nothing, and
+`design/execution.md`'s statement about the unit's own thread stays a fact for
+them and becomes conditional only for the declared.
+
+**A declaration and the counter's opt-out are incompatible**, and the pair is
+rejected when the actor is created rather than discovered at runtime: opting
+out reads as a permanently non-zero counter (`design/switching.md`), so such
+an actor would declare a price it can never pay.
+
+## 2026-08-13 — The wait epoch is written once, at park
+
+Three documents gave two answers, and `dev/INDEX.md` named the
+disagreement as an input to the detector's correctness rather than a matter
+of wording. `design/cancellation.md` moved the epoch when a wait ended,
+"which is why the bump belongs to the winner rather than to the next
+parking"; `design/pool.md` had it change "when it *parks again*, not when
+it wakes"; the wake protocol in `design/execution.md` has no bump step at
+all. The answer is the last two: **the epoch is written in step 1 of the
+parking protocol, together with the rest of the record, and nothing on the
+wake, cancel or resolution path touches it.**
+
+Two facts decide whether a signal is accepted, and they answer different
+questions. The epoch says which wait the signal belongs to. The winner
+field under OR, and `remaining` under AND, say whether that wait is still
+undecided. A late signal from a previous wait is rejected by the epoch,
+because the unit has re-parked and re-written it. A late signal from the
+current wait, already decided, is rejected by the winner or by the
+counter — and that test has to exist anyway, since two entries of one AND
+wait fire legitimately and two entries of one OR wait race legitimately.
+Bumping the epoch at the end of a wait would add a second mechanism for
+what the decided test already covers, and it would give the record's
+identity three writers instead of one: the winner of an OR wait, the cancel
+path, and the detector's owner-side resolution each end a wait.
+
+What this corrects in `design/execution.md`: step 4 of the wake protocol
+says retirement is safe because of "the epoch check in step 1", and within
+one wait it is not the epoch that rejects a retired entry's late fire but
+the decided test in step 3. The epoch covers the case its own step 1
+describes, where "the unit has since parked on something else". Both
+sentences are true of different windows and the document credits one
+mechanism with both.
+
+Found while settling this, and it belongs to the same correction: step 3
+must test whether the wait is already decided instead of inferring it from
+the arithmetic. A retired entry that fires after `remaining` reached zero
+decrements it to a negative value, which no reader is prepared for.
+
+Applying all of it to `design/cancellation.md`, `design/execution.md` and
+`design/pool.md` is step S5.3. `design/pool.md`'s sentence goes with the
+whole of its unit-walking section, which `dev/INDEX.md` already retires:
+the detector walks the collector's object graph, and a unit is no longer a
+pool slot.
+
+## 2026-08-13 — Scheduling an actor: one ready set, private lists, no thief
+
+Supersedes `crossbeam-deque`, taken on 2026-08-12 without a comparison,
+and supersedes this entry's own first form, which put ready actors into
+per-worker queues and then needed shedding, lanes and a vetting rule to get
+them back out. That machinery answered a question that does not exist.
+**What is distributed is the right to run one message.** A ready actor in a
+queue is a pointer in a list, not a resident of a thread, so nothing has to
+be moved between queues; a worker only has to decide which actor's next
+message it mounts.
+
+**Two structures exist because two kinds of memory exist, and this is not a
+locality choice.** An ordinary coroutine has non-atomic reference counts in
+its thread's heap and is pinned for life, so its queue is private to its
+worker and needs no atomics at all. An actor carries its arena and may be
+mounted anywhere, so only actors reach a shared structure. Vyukov's 2014
+NUMA-aware scheduler proposed the same split for Go — "work I would like to
+do myself", single-producer and lock-free, beside "work I am ready to
+share" — and it was never implemented, because affinity is a whole-runtime
+property and the runtime had shipped without it. Here the split follows from
+the memory model instead of being retrofitted onto it.
+
+**What is queued, and what is not.** One entry per ready actor, and never a
+message. The mailbox belongs to the actor, is never shared, and its depth is
+invisible to the queue: three messages and three hundred thousand put the
+same single entry into it. A mounted actor is in no queue at all, which is
+why queue length alone is never the load signal — BEAM stalls exactly there,
+two full-time processes on one scheduler holding the run-queue length at 1
+forever while a second scheduler stays out of work (erlang/otp#9762, the
+revert of "don't steal a lone task").
+
+**The actor's readiness word is the arbiter.** It is named apart from the
+unit's state word deliberately: `Running`, `Parked` and `Woken` belong to a
+unit and are plain stores on its own thread, while an actor's readiness is
+atomic, because any thread may post to its mailbox. Three values and five
+transitions, and the table has to be complete, since a missing transition is
+how an actor comes to run on two workers at once.
+
+| Who | Transition | When |
+|---|---|---|
+| a sender, on any thread | empty → ready | after pushing into the mailbox; the winner enqueues the actor into the ready set and the loser does nothing |
+| a worker | ready → running | before it takes a message; whoever loses this does not mount |
+| a worker | running → running | it keeps the actor and takes the next message, while its message budget lasts |
+| a worker | running → ready | the budget is spent and the mailbox is not empty: it enqueues the actor and lets go |
+| a worker | running → empty | the message is done and the mailbox reads empty |
+
+**Only the winner of a transition into running may mount, and a worker that
+has just published empty is no longer a winner.** It re-reads the mailbox
+after publishing, because a message posted inside that window leaves an
+actor nobody enqueued, and that hang is unreportable: the detector reads a
+non-empty mailbox as proof that the wait can still be served
+(`design/deadlock.md`). What the re-read produces is an enqueue and never a
+mount — the worker attempts empty → ready itself, exactly as a sender would,
+and stops if it loses. Mounting on the strength of a re-read is the
+two-worker bug, because a sender may have won empty → ready in the same
+window and another worker may already hold the actor.
+
+**The readiness word stays `running` for the whole message**, across every
+park inside it, which is what keeps a sender from putting a second copy of the
+actor into the ready set while a unit of it is in flight. A ready-set entry
+therefore means one of two things, told apart by the unit's own word: take the
+next message from the mailbox, or mount the unit that reads `WokenShared`.
+
+The window closes only under the orderings that go with it: the mailbox push
+is a release store, the re-read an acquire load, and the readiness word is
+sequentially consistent. With a relaxed store on either side the message is
+lost for good, in the way the paragraph above makes unreportable.
+
+**The ready set is one shared intrusive list under a mutex.** Intrusive
+because the link lives in the actor, so an enqueue allocates nothing and
+cannot fail, which the wake protocol requires: a unit in `Woken` is owed a
+slot, and an enqueue with a failure path would have nowhere to record the
+debt. A mutex rather than a lock-free structure because BEAM tried lock-free
+run queues, kept one mutex per queue, and recorded that the lock-free
+version performed worse without the reason being investigated. The rate that
+reaches it is one enqueue per newly-ready actor and one acquisition per
+batch refill, not one per operation.
+
+**Each worker has two private lists, single-owner and without atomics:**
+pinned ordinary coroutines, and units woken mid-message. Both are intrusive
+for the same reason as the ready set. A worker drains its own lists first,
+because that work is warmest, alternating between them under a budget of
+consecutive items so that an actor is not left behind a stream of pinned
+coroutines that park and re-wake on their own thread.
+
+**The budget counts items and can bound nothing else.** Duration is beyond
+it: this substrate has exactly two preemption points, a park and a message
+boundary, and a pinned coroutine computing for two hundred milliseconds
+reaches neither. Everything queued behind it on that worker waits, and no
+other worker may take it — the coroutine cannot move at all, and nothing in a
+private list is readable from outside. That is not mitigated, it is the shape
+of a runtime without preemption, and it is the reason a batch taken from the
+ready set stays small: work in a batch is as trapped as work in a private
+list, so a batch is a prefetch rather than a reservation. Both the batch and
+what is mounted count as load, or placement keeps sending work to the worker
+that is deepest in it.
+
+With its lists empty a worker refills its batch from the ready set in one
+acquisition, preferring actors whose last worker was itself, because their
+arena is warm there. **The preference is a bounded look and not a search:**
+it examines a fixed prefix and takes the head otherwise. A scan proportional
+to the list's length would put the wrong thing inside the one shared critical
+section, since that list is longest exactly when the machine is busiest.
+
+**A woken mid-message unit goes to its owner's private list, and leaves it
+only under the opt-in.** The default is the price rule of the entry above: a
+move here carries the live stack and the saved registers, while a move
+between messages carries nothing. It goes to the ready set instead only when
+four things hold together — the actor declared mid-message movement, the
+owner is loaded, the unit's foreign-frame counter is zero, and this actor has
+not already moved during this message. The last condition is Edmond's, and it
+is what keeps the price bounded: the profile this exists for parks a hundred
+times inside one message, and moving at every park would take the ready
+set's mutex a hundred times where one message should take it once.
+
+Either branch can be wrong and neither is revisited. A unit sent to the ready
+set whose owner frees up a moment later paid the move for nothing; one left
+with a loaded owner waits for it. One move per message bounds the error as
+well as the price, and none of it is measured.
+
+**No worker reads another worker's list, and there is no thief.** An idle
+worker looks in exactly one shared place. Rejected on this axis: a shed
+lane per owner, which would force a worker with empty lists to read N−1
+foreign lanes before it may sleep, restoring an O(N) foreign read per idle
+transition and the O(N²) fleet behaviour that disqualified stealing in the
+first place — Go's own diagnosis at 56 cores is that "the work stealing
+algorithm degenerates to O(N²) due to N cores all inspecting each other's
+mostly empty run queues" (golang/go#28808, open since 2018).
+
+**"This worker has nothing to do" is one predicate over five places** — its
+two private lists, its batch, its intake queue and the ready set — and it is
+written once, in one function. Go's `runqempty` went silently wrong the day
+`runnext` was added, and every balancing decision built on it inherited the
+error. The intake queue belongs in the predicate: a worker that sleeps on an
+undrained intake queue sleeps on a conditional resolution the collector is
+waiting to have applied.
+
+**The last worker to sleep still owes `design/deadlock.md` its observation**,
+and that document asks for "every run queue empty" from a time when there was
+one queue per worker. Restated for this structure: the last worker is the one
+whose idle bit completes the mask, and it reads the ready set's emptiness
+under the mutex it is about to release. No other worker's private lists have
+to be read, because a worker holding anything in its lists has not published
+its bit. The condition may be read racily, as that document allows, since a
+needless pass is only a pass.
+
+**Load is two numbers.** Placement reads total load, pinned coroutines
+included, because a worker deep in work that cannot move must stop
+receiving actors that could have run elsewhere. Shedding and the drain
+budget read the actor class alone. Both count what is mounted beside what is
+queued, for the reason erlang/otp#9762 records.
+
+**An enqueue into the ready set is what rings a sleeper, and it rings
+exactly one.** The insertion reports whether the set was empty before it,
+and only that edge wakes anybody — the mechanism TrueAsync's cross-thread
+queues use, where the enqueue hands back `was_empty` and the caller signals
+on it alone. The signal is the wake descriptor the reactor already has
+(`design/reactor.md`), and it is rung outside the ready set's mutex, because
+a system call inside the one shared critical section would serialize every
+worker behind it. A sender may be a thread that is no worker at all — a
+consumer calling in over the C ABI — so the obligation belongs to the
+enqueue rather than to any worker's turn.
+
+**Going to sleep is an order, not a check.** A worker publishes its idle
+bit, then re-reads the ready set, and only then sleeps; without that order
+an enqueue that lands between the check and the sleep rings nobody, since
+the bit was not yet visible. The bit says asleep or about to be, and a
+worker woken for work clears its own bit — a waker that cleared it would
+leave a worker that never woke invisible to the last-to-sleep condition
+below.
+
+**The collector roots the memory mark in the scheduler's ownership table and
+in no queue.** Ruled by Sage, and it repairs what this entry first said. The
+table is a registry of lifetimes rather than a map of current owners: a unit
+or an actor joins the creating worker's shard when it is created and leaves on
+its terminal transition, while a move never touches the table, because the
+current owner is named by the claim word (see the re-mounting entry of this
+date). Rooting in the queues instead would have the collector read
+non-atomic single-owner lists from its own thread, which it cannot do without
+a race. The prohibition in `design/deadlock.md` is untouched: it forbids the
+scheduler's table as a *liveness* root, and this is the memory mark. L is
+rooted nowhere in the scheduler.
+
+Four invariants make the table complete, each checkable at a queue operation:
+
+1. only a registered handle is ever pushed;
+2. an object's word takes its queued value before the push — `ready` before
+   the ready set, `Woken` before a private list — which both protocols
+   already prescribe;
+3. a pop does not remove from the table; removal happens on the terminal
+   transition alone, after which no enqueue of that handle is possible;
+4. scheduler queues are intrusive and carry no payload: nothing lives only in
+   a queue.
+
+Together they give "reachable from a scheduler queue implies registered", so
+the walk begins with complete roots without reading the ready set, the private
+lists, a batch, or an in-transit cell. What the collector asks about an actor
+— whether a unit is mounted, whether one is queued, whether the mailbox is
+empty — it reads from the actor's own words, and invariant 2 is what makes
+those reads truthful. The cost is one shard lock at registration and one at
+removal, once in an object's life, plus a root scan the size of the tables. The handshake is narrower than the roots. A worker answers only for actors
+at a message boundary — idle, in the ready set, or in its batch — because
+only there is the arena consistent. A unit in the woken-mid-message list was
+unmounted with reason `Park`, so its arena holds whatever the message left
+half-done, and `design/execution.md` forbids answering for it. Mark
+termination waits on such a unit exactly as it already waits on a parked
+actor: a cost that document records, not a new one.
+
+**The message rides the mailbox; only the placement rides a queue. What
+this obliges `design/deadlock.md` to change is its actor-call row.** That row
+reads the callee's current unit, a queued unit, or a non-empty mailbox, and
+all three are false in one window: the worker has taken the message out of
+the mailbox and has not yet created the unit. Readiness now lives in the
+actor's readiness word, so the row has to read it, with ready or running
+counting as live. Without that a healthy synchronous call between two actors
+is reported deadlocked, which breaks the one promise the detector rests on.
+An earlier form of this entry asked instead that a mailbox deposit become a
+served-set form; that was the wrong repair, because a sender writes the
+mailbox directly and rides no intake queue, and the case it named was already
+covered by the non-empty-mailbox branch.
+
+**Rejected, with the property each lost on.** `crossbeam-deque`: it drags in
+`crossbeam-epoch`, a second deferred-reclamation machine beside the
+quiescence scheme in `design/pool.md`; it allocates on the push path when
+the buffer is full and on the pop path when it shrinks below a quarter; its
+buffer is a private `Atomic<Buffer<T>>` with `Worker<T>` not `Sync`, so no
+third thread may enumerate it for rooting; and its steal takes whatever is
+at the far end, which cannot express a refusal. A thief as the primary
+mechanism: the foreign reads above, and a hit rate worse than Go's, because
+most of what it would find is pinned by construction. One global queue with
+no private half: contention on every mount rather than once per batch.
+A bounded ring with a shared index for either structure: TrueAsync's own
+benchmark measured that shape at 2.3 M ops/s against 56–68 M for
+per-producer sub-queues at eight producers.
+
+**Unmeasured, and named as such:** the batch size, the drain budget, how
+many messages of one actor a worker runs before returning it to the ready
+set, whether the ready set wants splitting per NUMA node, and what a cold
+arena is worth in the take preference. Nothing here is measured on our
+workload, because there is no code. The figure that decides where
+measurement starts is the one above: a per-message placement rate
+approaching a million per second is within an order of magnitude of the
+contention collapse that benchmark found, so the ready set is the first
+thing to put under a load generator. Two acquisitions per message is the
+worst case — one placement and at most one mid-message move — and that holds
+only because of the one-move bound. Without it the profile the opt-in exists
+for, a hundred parks in one message, would take the shared mutex a hundred
+times per message, and the collapse would arrive four orders of magnitude
+earlier than this paragraph implies.
+
+## 2026-08-13 — Superseded: two run queues, placement instead of stealing
+
+The entry this replaced proposed placement at wake time with surplus shed by
+the owner into a per-worker lane. A Critic round found nine high-severity
+defects; four were structural and are what the entry above answers. Kept
+here as the record of what was tried: an idle actor has no unit, so nothing
+arbitrated its placement and neither the "exactly one enqueue" invariant nor
+the foreign-frame counter applied to it; the vetting that justified
+owner-side shedding was available only where the decision was already local;
+per-owner lanes restored the very scan that disqualified stealing; and
+filling a lane at a turn boundary tied the offload rate to the boundary rate
+of the busiest worker, which is also why "bounded by one message" was not a
+bound.
+
