@@ -2,15 +2,20 @@
 
 ## What a pool is
 
-A pool is a set of slabs holding fixed-size slots of one kind. Every
-object the substrate owns lives in one: units, actors, sockets, timers,
-buffers, and the operations in flight against them.
+A pool is a set of slabs holding fixed-size slots of one kind: sockets,
+timers, buffers, and the operations in flight against them. A coroutine and
+an actor are not pooled. A coroutine is an object of the memory manager and
+its lifetime is its reference count; an actor's header lives in the arena it
+owns, so that it travels with the memory it works with
+(`dev/DECISIONS.md`, 2026-08-12 and 2026-08-13).
 
 Pools exist for three reasons, and only the first is about allocation:
 
-- **Parking allocates nothing.** A unit's wait record lives in its slot,
-  so recording a wait is a write rather than a malloc on the path that
-  runs once per suspension.
+- **Submitting an operation allocates nothing.** Its slot holds what the
+  kernel's completion will need, so submission is a write rather than a
+  malloc on a path that runs once per operation. Parking allocates nothing
+  either, for a reason that is not the pool's: the waker is embedded in the
+  coroutine (`dev/DECISIONS.md`, 2026-08-12).
 - **Enumeration needs no registry.** Walking the slabs of a pool lists
   every object of that kind. `php-src/ext/async` keeps a hash table of
   coroutines and another of channels in a potential-deadlock state; the
@@ -36,15 +41,15 @@ generation. A stale handle — a wake for an operation whose unit finished,
 a cancel for a unit that completed — fails the comparison and does
 nothing.
 
-Everything that names an object across a thread boundary carries a
-handle: run queue entries, wakers, cancel handles, and the `poster` field
-of a wait record. `wake` carries one too
-(`design/execution.md`), which is what lets a waker validate the occupant
-and not merely the wait.
+**A handle names a pooled object and nothing else.** A coroutine and an
+actor are named by counted references: whoever arms an entry of a wait holds
+one, so `wake` cannot find its target missing and needs no generation to
+check (`design/execution.md`). What travels as a handle is what a pool owns
+— an operation, a buffer, a socket, a timer — and it travels across thread
+boundaries, where a stale one must fail rather than resolve.
 
-A pointer with flags in its low bits was the earlier design and is gone.
-The suspension kind lives in the slot, which dispatch reads anyway, and
-a generation does not fit beside a pointer in one word.
+A generation does not fit beside a pointer in one word, which is why a
+pooled object is named by a handle rather than by a pointer with flags.
 
 ## Slabs do not move and are not freed
 
@@ -66,131 +71,90 @@ load, so a walker that started before a slab was added does not see it.
 | `kind` | 8 bits | which pool this slab belongs to; read for assertions, and by the detector to pick a resource's liveness rule (`design/deadlock.md`) |
 
 The generation is incremented **when a slot is allocated**, not when it is
-released, and it is the only counter that distinguishes occupants. The
-epoch inside a unit's wait record distinguishes waits of one occupant.
-A wake validates both, and it can, because it carries the handle.
+released, and it is the only counter that distinguishes one occupant of a
+slot from the next. A coroutine's wait epoch is a different counter in a
+different place: it distinguishes one wait of one coroutine
+(`design/execution.md`), and nothing in a pool reads it.
 
 **Thirty-two bits wrap.** A slot recycled ten thousand times a second
 wraps in about five days, and this design deliberately lets an operation
-outlive the unit that submitted it, so a wake can be in flight for a long
-time. Wrapping is survivable only because a stale wake must also match
-the epoch of a wait that no longer exists; it is not proof, and a 64-bit
-generation with a narrower slot index is the fallback if the argument
+outlive the unit that submitted it, so a completion can be in flight for a
+long time. Wrapping is survivable only because a stale completion must also
+pass the epoch check of the wait its operation names; it is not proof, and a
+64-bit generation with a narrower slot index is the fallback if the argument
 turns out to be thin.
 
 ## Reclamation is deferred, and that is what makes waking safe
 
-A waker validates a handle and then writes: the result into an entry's
-slot, then a counter, then the state word (`design/execution.md`).
-Validating and writing are not one atomic step, so between them the unit
-may complete and its slot may be released.
+A completion resolves an operation's handle and then reads the slot: the
+waiter it names, the entry index, the epoch to validate. Resolving and
+reading are not one atomic step, so between them the operation may take its
+last owed completion and its slot may be released.
 
 **A released slot is not handed out again until every worker has passed a
 quiescent point after the release.** Workers are quiescent between
 messages, which they reach constantly, so the delay costs a per-worker
-counter published once per scheduler turn and nothing on the wake path.
+counter published once per scheduler turn and nothing on the completion
+path.
 
-What this buys: a late waker writes into a slot that is free but not yet
-reused, which harms nothing, and then fails its final compare-and-swap on
-the state word because the state is free. A slot handed out immediately
-would instead take those writes into a live occupant's record — a result
-in an entry that never fired, a decremented counter, a unit woken out of a
-wait nothing satisfied.
+What this buys: a late reader reads a slot that is free but not yet reused,
+sees the free state and stops. A slot handed out immediately would instead
+give it a live occupant's fields, and a completion would be attributed to an
+operation that never ran.
 
-The generation is what rejects a wake that arrives *after* reuse; the
+The generation is what rejects a read that arrives *after* reuse; the
 deferred reclamation is what rejects one that arrives *during* it. Both
 are needed, and the earlier design had only the first.
-
-## The wait record is a seqlock
-
-A walker reads a parked unit's record while other threads may write it.
-The epoch doubles as the sequence number that makes the read consistent:
-
-- **Odd means being written.** A unit entering a park makes the epoch odd,
-  writes the entries, then makes it even. `design/execution.md` orders
-  parking as state, then record, then arm, and this is the record step in
-  detail.
-- **A reader** loads the epoch, reads the entries, then re-loads the
-  epoch. Equal and even means the entries belong to one wait. Anything
-  else means retry or abandon.
-
-Without this the walker reads the entries of a new wait under the epoch of
-the old one, because the epoch was written first, and composes a wait that
-never existed.
 
 ## Walking a live pool
 
 A walker iterates slabs and slots, reads each header with an acquire load,
-and skips anything not in the state it wants. Its consumer is the
-diagnostic dump that answers "what is everything waiting on". The deadlock
-detector does **not** walk the pool: it follows resource handles from one
-slot to the next, which costs the reachable subgraph rather than the
-population (`design/deadlock.md`). The rules below serve both, because
-both read slots other threads are writing.
+and skips anything not in the state it wants. Its consumer is the diagnostic
+dump that answers "what is everything waiting on", including the case no
+detector can report: a write end held by live code that never writes
+(`design/deadlock.md`). The detector itself walks nothing here — it computes
+liveness over the collector's object graph — so the rules below serve the
+dump alone.
 
-**What a validated read guarantees, exactly:** that at some instant
-between the two epoch loads, this slot held this occupant, parked on this
-wait. It guarantees nothing before or after that instant, and nothing at
-all about any other slot.
+**What a validated read guarantees, exactly:** that at some instant between
+the two header loads, this slot held this occupant in this state. It
+guarantees nothing before or after that instant, and nothing at all about
+any other slot.
 
-Three rules follow, and the third is the one the earlier version was
-missing:
+Two rules follow:
 
-1. **Re-read the state word, not only the generation and the epoch.** A
-   unit's epoch changes when it *parks again*, not when it wakes, so a
-   unit that woke and is running still carries the epoch the walker first
-   saw. Only the state word says it is no longer parked.
-2. **Accept false negatives.** A unit that parks after the walker passed
-   it is missed, and the walk runs again.
-3. **A conclusion spanning several slots must be re-validated as a
-   whole.** Slots are validated at different instants, so a set assembled
-   from them was never observed simultaneously. `design/deadlock.md`
-   re-validates every member after its candidate set closes, and this
-   sentence is the contract it relies on.
+1. **Accept false negatives.** A slot that changes state after the walker
+   passed it is reported as it was, and the walk runs again.
+2. **A conclusion spanning several slots must be re-validated as a
+   whole.** Slots are read at different instants, so a set assembled from
+   them was never observed simultaneously. A dump that draws a wait graph
+   from several slots is describing a system that may never have existed in
+   that state, and it says so rather than pretending otherwise.
 
 The cost is a linear read of live slots in address order, with no pointer
 chasing.
 
 ## Slot layouts
 
-### Unit
+### Where a coroutine and an actor live instead
 
-| Group | Contents |
-|---|---|
-| header | `state`, `generation`, `kind` |
-| suspension | kind (stackful or stackless), stack pointer for the former, state-machine pointer and its vtable for the latter |
-| wait | mode, `epoch`, `remaining`, winner, the detector's claim word, and two entries: resource handle, cancel handle, result, fired |
-| scheduling | run queue link, the foreign-frame counter, the affinity flag, the retryable flag the consumer sets at creation |
-| consumer | one opaque word the mount hook owns, where Limelight keeps its actor context |
+Neither is a slot, and this is the largest of the corrections this document
+carries. A coroutine is an object of the memory manager: its wait record and
+two inline entries sit in the object, further entries spill into one raw
+block freed through `deferred_free`, and the scheduler holds one counted
+reference for as long as it owns the coroutine (`dev/DECISIONS.md`,
+2026-08-12). An actor's header sits in the arena the actor owns, so that it
+travels with the memory it describes: the state word, the mailbox, the unit
+mounted for the message in flight, and the intrusive link by which the
+scheduler queues it (`dev/DECISIONS.md`, 2026-08-13). The saved machine
+context is in neither place — it sits at the top of the coroutine's own
+stack (`design/switching.md`), which is a pooled object in its own right.
 
-The saved machine context is not here: it sits at the top of the unit's
-own stack (`design/switching.md`), so the slot's size does not follow the
-platform's register file.
-
-Two wait entries cover an operation and a timer, which is `await` with a
-timeout. A wait with more entries takes a spill slot from the same pool
-and stores its handle in place of the entries. A spill slot's state marks
-it as a spill so a walker skips it as a unit, and it is freed under the
-same deferred reclamation as any slot, so a walker mid-read is safe.
-
-### Actor
-
-| Group | Contents |
-|---|---|
-| header | `state`: idle, has messages, or running |
-| current | the handle of the unit mounted for the message in flight, or none |
-| mailbox | head and tail, and the queued count |
-
-**Actors need slots because the wait edge points at them.** A unit parked
-on a reply from another actor names that actor, and the walker must be
-able to ask what the actor is doing. It follows `current` to the unit
-processing the actor's message and continues from there, which is how an
-actor-mediated cycle closes — the primary case for a PHP runtime.
-
-An actor that is idle with an empty mailbox has no unit to follow. The
-walker treats such an edge as live rather than blocked, because any
-sender could wake it and the walker cannot prove none will. That is a
-false negative by construction and it is the safe direction.
+What the detector asks about an actor is therefore read from that header
+rather than from a slot: whether a unit is mounted, whether one is queued,
+and whether the mailbox is empty (`design/deadlock.md`). An actor that is
+idle with an empty mailbox is answered by the liveness table of that
+document and not here.
 
 ### Operation
 
