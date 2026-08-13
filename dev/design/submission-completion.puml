@@ -1,0 +1,99 @@
+@startuml submission-completion
+title Submitting a single-shot operation and delivering its completion\n(design/reactor.md, design/pool.md, design/execution.md)
+
+skinparam ArrowColor #444444
+skinparam sequenceMessageAlign left
+
+participant "unit\n(the waiter)" as U
+participant "reactor\non worker A" as R
+participant "pool\n(operation slot)" as P
+participant "kernel" as K
+participant "sched\non worker A" as SA
+participant "sched\non worker B" as SB
+
+note over R, P
+  **This is the single-shot path.** A multishot operation names the
+  socket's handle and never a unit; its completions append to a queue
+  in the socket slot, and the waiter lives in that slot's own
+  queue-waiter cell. A cancel operation names no waiter at all.
+end note
+
+== Arming, inside park step 2 ==
+
+U -> R : submit(operation, buffer)
+R -> P : take a slot
+activate P
+R -> P : write the waiter cell — a counted\nreference to the unit, the entry index,\nthe epoch
+note over P
+  One writer, one emptier, one thread:
+  the worker that owns the ring the
+  operation goes to.
+end note
+R -> R : write into the submission ring
+alt the submission answers at once, and that ends the wait\n(OR, or AND with nothing left outstanding)
+  R --> U : an inline result
+  U -> U : retire every entry armed so far and continue.\nSteps 3 and 4 do not run
+else it answers at once under AND, entries still outstanding
+  R --> U : an inline result, retire nothing
+  U -> U : park steps 3 and 4
+else it does not answer at once
+  U -> U : park steps 3 and 4
+end
+SA -> R : the turn flushes the batch
+R -> K : submissions
+
+== The kernel answers ==
+
+K -> R : completion
+R -> P : resolve the handle, read the slot
+alt the waiter cell holds a reference
+  R -> P : move the reference out of the cell\ninto the wake payload
+  R -> SA : wake(unit, entry, epoch, result)
+  SA -> SA : **step 0 — dispatch on the state word**
+  group four outcomes
+    alt the word names this worker
+      SA -> U : steps 1..4 — the epoch test, the result\nstore, decidedness, retirement
+      alt ordinary
+        SA -> SA : step 5 — store Woken, enqueue\ninto this worker's private list
+      else the move path — a declaring actor,\na loaded owner, no foreign frame,\nthe move unspent
+        SA -> SA : store-release WokenShared, push to the\nshared ready set, ring a sleeper
+      end
+    else the word names worker B\n(a declaring actor only)
+      SA -> SB : post the payload into B's intake queue
+      SA -> SB : ring B through the worker driver's waker
+      SB -> U : steps 1..5 run there
+    else WokenShared\n(a declaring actor only)
+      SA -> SA : drop a wake and a resolution;\nfor a cancel write the byte and\nre-read the word — the answer\nfollows the re-read
+    else Terminal
+      SA -> SA : drop the signal and release what it\ncarried; a cancel's promise is\nresolved *already finished*
+    end
+  end
+else the cell is empty
+  R -> P : read an empty cell
+  note over P
+    Two events empty it, both on this worker:
+    the retire of the entry — phase 0 of the
+    kernel cancel — and an earlier completion
+    of this same operation, which already moved
+    the reference into its own wake payload.
+  end note
+  R -> R : wake nobody
+end
+
+== Release ==
+
+R -> P : decrement the owed count
+alt the count is not zero
+  R -> R : a zero-copy send still owes its\nnotification; a cancelled operation\nstill owes the cancel's completion.\nHold the slot and the buffer
+else zero
+  P -> P : store free, publish to the retire list
+  deactivate P
+end
+note over P
+  The slot becomes takeable only after every worker
+  has passed a quiescent point. That is one of the
+  four conditions under which a 32-bit generation is
+  safe; the other three are in design/pool.md.
+end note
+
+@enduml

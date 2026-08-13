@@ -1,0 +1,89 @@
+@startuml parking
+title Parking protocol — the four steps of design/execution.md
+
+skinparam defaultTextAlignment left
+skinparam ArrowColor #444444
+
+legend left
+  |= colour |= whose code the box is (dev/ARCHITECTURE.md) |
+  |<#DDEBF7>  | unit — the record mechanics and the suspension |
+  |<#E2EFDA>  | the armer of the entry — sync, reactor, the actor call |
+  |<#FCE4D6>  | sched — the enqueue |
+  Every step runs on the unit's own thread; the split is by whose code
+  runs, not by which thread. Step 3 is the unit's own suspension, step 4
+  is the worker's, and the stores of step 4 are unit record operations
+  the worker calls. Retirement is a unit operation too, and the handle
+  body it invokes belongs to the armer.
+endlegend
+
+start
+
+#DDEBF7:**1. Write the record**
+a fresh epoch, the entries, the mode,
+and remaining for an AND wait.
+The only place the epoch is written:
+no path that ends a wait touches it;
+
+note right
+  Arming after the record is written is what
+  guarantees a completion finds somewhere
+  to record itself.
+end note
+
+partition "**2. Arm each entry**, one at a time" {
+  while (entries left to arm?) is (yes)
+    #E2EFDA:submit the operation, send the message
+    or arm the timer — carrying the unit, its
+    entry index and the epoch of step 1;
+    #E2EFDA:install this entry's cancel handle;
+    if (satisfied inline?) then (yes)
+      if (OR, or AND with nothing left outstanding?) then (the wait is over)
+        #DDEBF7:retire every entry armed so far,
+        this one included.
+        The entries after it were never armed;
+        #DDEBF7:continue without suspending —
+        step 3 is skipped;
+        stop
+      else (AND, entries still outstanding)
+        #DDEBF7:retire nothing and go on arming;
+      endif
+    else (no)
+    endif
+  endwhile (no)
+}
+
+#DDEBF7:**3. Suspend**
+stackful: switch to the worker.
+stackless: return Pending from poll;
+
+note right
+  Step 4 is the worker's, not the unit's: a unit
+  that announced itself parked while its machine
+  context was still being saved would be resumable
+  before it was savable.
+end note
+
+if (is the cancelled bit set?) then (no)
+  #DDEBF7:**4. Store Parked**;
+  stop
+else (yes)
+  #DDEBF7:store the cancellation in the
+  record's own result slot;
+  #DDEBF7:claim the winner with the
+  reserved no-entry value;
+  note right
+    The claim comes before the retirement.
+    Retirement is asynchronous, and an entry
+    armed at step 2 that fires afterwards is
+    rejected by the claim and by nothing else —
+    the epoch is the one just written.
+  end note
+  #DDEBF7:retire the entries
+  through their cancel handles;
+  #DDEBF7:store Woken —
+  this unit is never Parked;
+  #FCE4D6:enqueue into this worker's list;
+  stop
+endif
+
+@enduml

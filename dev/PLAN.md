@@ -272,11 +272,30 @@ design document describes machinery that has been retired.
         Three modules have no design document and `dev/INDEX.md` now says
         which — the scheduler, the synchronisation primitives, the timer
         wheel — plus the whole C-ABI surface.
-- [ ] S5.5 PlantUML in `dev/design/`: parking, submission and completion,
+- [x] S5.5 PlantUML in `dev/design/`: parking, submission and completion,
       the object lifecycle
       done: the parking diagram matches the numbered protocol in
         `design/execution.md` step for step
       tier: T2 · role: Critic
+      Critic 2026-08-13 round 1: 18 findings, no critical. Arming was drawn
+        as a finished block, so the inline branch left later entries armed
+        after the wait was over; wake step 0 had three arms for four
+        outcomes and gave `WokenShared` the answer that belongs to
+        `Terminal`; the empty-cell arm made every multishot completion wake
+        nobody; the lifecycle had no `Running → Woken` edge and so
+        contradicted the parking diagram; release followed one completion
+        unconditionally. All accepted.
+      Critic 2026-08-13 round 2: five more, one of them introduced by the
+        first round's own fix — the new `Running → Woken` edge credited the
+        store to the unit where the whole point of separating step 4 is
+        that the worker performs it. Also: the inline path parked a unit
+        that had not suspended, the empty cell was given one cause of two,
+        and the legend invented a second thread. Fixed; the acceptance
+        criterion was judged met in the same round.
+      handoff: `dev/design/` holds three `.puml` sources and no rendered
+        images, per `dev/INDEX.md`. All three pass `plantuml -checkonly` and
+        render; the renders were read, not assumed. `plantuml` is installed
+        at `/usr/bin/plantuml`.
 - [x] S5.6 Toolchain and build, as a `dev/DECISIONS.md` entry
       done: the rustc version and where it comes from (the single-LLVM
         rule in the rfc), edition, MSRV, backend features, CI targets

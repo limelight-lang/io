@@ -1,0 +1,72 @@
+@startuml object-lifecycle
+title The lifecycle of a unit — design/execution.md
+
+skinparam defaultTextAlignment left
+skinparam ArrowColor #444444
+
+state "create" as Create
+state "queued" as Queued
+state "released" as Released
+
+note top of Create
+  **Only the four boxes below are values of the state word.**
+  `create`, `queued` and `released` are stages of a lifetime and
+  are not states: there are three parking states, and `Terminal`
+  is a fourth value of the word that is not a parking state.
+end note
+
+[*] --> Create : allocate the object; take a stack\nfor a stackful unit
+
+Create --> Queued : enqueue. A third enqueue, outside the\nwake invariant: the unit has no record\nyet and no waker can name it
+
+Queued --> Running : the scheduler mounts it. Dispatch reads\nthe suspension kind here, once, and\nbranches to one of two resume routines
+
+Running --> Parked : the **worker** stores it once the suspension\nhas finished — park step 4, unmount hook\nreason **Park**
+
+Running --> Woken : park step 4 with the cancelled bit set: the\n**worker** stores Woken and enqueues, and\nthe unit is never Parked
+
+Parked --> Woken : whoever ends the wait, and the same caller\nenqueues. One enqueue per wake, because\none caller moves Parked to Woken and a\nsecond finds Woken already set and returns
+
+Woken --> Running : the scheduler mounts and resumes. For a\ndeclaring actor in WokenShared the mount is\na compare-exchange to Running(W), and\nwhoever loses does not mount
+
+Running --> Terminal : the worker, once the unit's own code has\nfinished — unmount hook reason **Boundary**
+
+Terminal --> Released : the last reference goes
+
+Released --> [*]
+
+note right of Parked
+  **Woken means the wait is decided.**
+  Whoever moves Parked to Woken has already
+  claimed the winner or taken remaining to zero,
+  so a later signal for the same wait finds
+  nothing to do.
+end note
+
+note right of Terminal
+  The order inside teardown: the unmount hook with
+  reason Boundary, the Terminal store, the join
+  wakes, the release of the wait record, the return
+  of the stack, the drop of the scheduler's reference.
+
+  Storing Terminal earlier would report an ordinary
+  unwind as a deadlock, because a terminated holder
+  is one that never releases. Storing it later would
+  let a retired completion pass wake step 0 and read
+  the epoch out of a record already freed.
+
+  The join wakes follow the store, which is what lets
+  the detector read a terminal target as live: a pass
+  that sees Terminal knows the wake is on its way.
+end note
+
+note bottom
+  **An actor that declares mid-message movement carries a wider word**,
+  and only such an actor does: Running(W), Parked(W), WokenLocal(W),
+  WokenShared, Terminal — the owning worker beside the state, atomic
+  stores instead of plain ones, and the cancelled bit moved to a byte
+  beside it. For every other unit "its own thread" is the thread it has
+  always run on, and no wake of it is ever dispatched to another worker.
+end note
+
+@enduml
