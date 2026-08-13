@@ -1118,3 +1118,174 @@ filling a lane at a turn boundary tied the offload rate to the boundary rate
 of the busiest worker, which is also why "bounded by one message" was not a
 bound.
 
+
+## 2026-08-13 — The waiter cell: what a pool slot names, and who empties it
+
+Applying the retirement of the 64-bit handle to `design/pool.md` exposed a
+question the corrections table never asked: an operation slot used to name
+its waiter by a handle whose generation rejected a stale read, and a
+coroutine has no generation now. Sage's ruling, executed as written.
+
+**A slot names its waiter through a waiter cell** — a counted reference to
+the unit, the entry index and the epoch — and the reference is what keeps
+the unit alive across the window. The cell is written at step 2 of the
+parking protocol by the unit's own thread, which owns the ring the
+operation goes to, and emptied by that same worker at whichever comes
+first: the completion carrying the result, which moves the reference into
+the `wake` it calls, or the retire of the entry, which drops it before the
+kernel cancel is submitted. One thread performs both, so a completion never
+loads a reference another thread is dropping. A completion that finds the
+cell empty adjusts the owed count and wakes nobody.
+
+**Two slots hold no cell of their own.** A multishot operation names the
+socket's handle and never a unit, because the unit re-parks between chunks;
+the reference for a wait on that queue lives in the socket slot's own
+queue-waiter cell. A cancel operation names the operation it cancels.
+
+**The waiter cells of armed slots are memory-mark roots**, alongside the
+timer wheel and the reactor intake queues. Rejected: the argument that the
+cell is safe because a unit with an armed entry is parked and therefore
+reachable from the scheduler's ownership table. It fails for a window — a
+retire posted across threads is applied a turn later, and inside that turn
+the unit can resume, finish and leave the table while the cell holds what
+may be the last reference — and it fails on the model, whose collector
+explains a reference count by enumerated in-edges: a counted cell the walk
+cannot see leaves the difference permanently positive and reports the
+runtime's own pools as external roots on every pass. L is rooted in no pool
+and flows through none, so the liveness fixpoint still walks nothing there.
+
+**A cross-thread cancel request carries a promise**, resolved by the one
+worker that applies it, which reads the state word on the thread that owns
+it. The requester reads no state word. Same-thread, the answer is the
+call's return. For an actor that declared mid-message movement two answers
+come from the delivery rule's single load: `Terminal` is *already
+finished*, `WokenShared` is *delivered*.
+
+**A cancel for a unit in `WokenShared` is the cancelled byte**, written
+from wherever the canceller is; the worker that wins the mount inherits the
+bit. `design/execution.md`'s step 0 had compressed the delivery rule to
+"forward or drop" and lost that case.
+
+Two defects of mine that the same round found, both now fixed in the
+documents. A cancel decides a wait by claiming the winner field, and the
+record therefore carries that field under AND as well as under OR: nothing
+else could represent "decided" once the epoch stopped being bumped, and a
+canceller writing `remaining` to zero would be indistinguishable from the
+last entry arriving while every entry was still armed. And `Terminal` is a
+value of the state word rather than a fourth parking state, stored after
+the unit's own code has finished and before the wait record is released —
+earlier reports an ordinary unwind as a deadlock, later lets a retired
+completion read a freed record — with a terminated coroutine excluded from
+the liveness roots, since it exists only because something still references
+it.
+
+## 2026-08-13 — Deciding a wait without an entry, and three protocol holes it opened
+
+A second Critic round against the corrections of S5.3 found four defects in
+what the first round's fixes had produced. Sage's ruling, executed as
+written.
+
+**A wait decided by no entry stores its error in the record's own result
+slot.** The record carries that slot beside the winner field, and a cancel
+or a detector resolution stores there and then claims the winner with a
+reserved value no entry index takes. An entry's result slot keeps exactly
+one writer — the wake that ends that entry — so a retired entry firing late
+writes where nobody reads. Without the slot the cancellation had nowhere to
+live but an entry, and step 2 of the wake protocol overwrote it: a channel
+send arriving after the cancel replaced the cancellation with a value, and
+the unit resumed reading data it was told it would not get, final
+cancellation included. **Step 2 does not move behind step 3**, and the
+reason it stands first is the AND return: a caller that does not take
+`remaining` to zero returns at step 3, so its result must already be
+stored.
+
+**A cancel against `WokenShared` writes the byte, re-reads the word, and
+answers from the re-read.** Supersedes the single-load clause of the waiter
+cell entry above, which let the canceller answer *delivered* on the strength
+of one load. One load orders nothing against the mount: the winner can mount,
+run, park and read an unwritten byte, and the byte lands where nothing reads
+it again — a shutdown counting a *delivered* against a unit it then waits on
+forever. The byte's store, the re-read, the mounting compare-exchange and
+park step 4's read of the byte are sequentially consistent for a declared
+actor, so a re-read that still says `WokenShared` puts the byte ahead of the
+mount. Rejected: folding the bit back into the word, which would make every
+owner-side transition a compare-exchange loop — the cost the byte exists to
+avoid.
+
+**A wait on a socket's multishot completion queue is always live**, and the
+kind stays external and not cycle-capable. Calling it dead while the series
+is un-armed would require proving that no buffer ever frees, which is false
+in the routine `-ENOBUFS` gap and would invent a deadlock against a loaded
+healthy connection. The one state the row cannot report — a waiter over a
+queue the reactor can never re-arm — is a fact the reactor already holds, so
+the reactor publishes it from a re-arm list after a threshold, with the
+buffer pool's state and a starved-re-arm counter.
+
+**The park-time recheck of that queue belongs to whoever writes the waiter
+cell, immediately after the write.** The ring's own worker writes and
+rechecks inline; a unit on another worker posts the publish and suspends
+without reading the queue, and the owner rechecks when it drains the entry.
+The unit's own remote re-read defended nothing, because it ran before the
+publish it was meant to defend: a chunk appended in between found an empty
+cell, and the unit slept over a full queue until an unrelated chunk arrived,
+which for an idle socket is never.
+
+Named and not ruled: the close path owes the sentence that closing a socket
+empties the queue-waiter cell into a wake carrying the close error, which the
+always-live row rests on. Written into `design/reactor.md` with this entry.
+
+## 2026-08-13 — No pool is a memory root, L stops at a debtor's owner field, and the generation stands at 32 bits
+
+Sage's second ruling of the day, on three defects the Critic found in the
+application of the waiter-cell entry above. Executed as written.
+
+**Struck from that entry: "the waiter cells of armed slots are memory-mark
+roots".** A root whose enumeration is a slab walk is not a root, because
+that walk's own first rule is that it may miss a slot: a scan passing a free
+slot that is taken a moment later never sees the reference written into it,
+and a unit whose cell holds the last reference is freed under a retire still
+queued. **No pool is a root, and none needs to be.** While a wait is
+undecided the scheduler's ownership table reaches the unit, since a unit
+leaves that table only on its terminal transition and reaches one only by
+resuming, which requires the wait decided. Once it is decided, every cell is
+emptied inline on the unit's own thread except a socket's on another worker,
+and that pending retire is an intake entry — already a root with a defined
+scan. The pass therefore costs the pools nothing, by either mark, and the
+earlier claim that the scan was free because the collector would run it
+anyway is struck as false.
+
+**A cross-thread retire drops no reference where it runs.** The request
+carries a counted reference the poster took on the unit's thread; the
+applier moves the cell's reference into the confirmation it posts back; both
+are dropped on the unit's thread. Without it a foreign worker decremented a
+non-atomic count — a defect the waiter-cell entry introduced and the Critic
+did not raise.
+
+**L does not flow through the fields by which a debtor names its debtor** —
+a mutex's holder, a guard-semaphore's holder list, an actor's current unit,
+a join's target — and the attribution walk crosses none of them. The
+retirement of the 64-bit handle left a counted reference as the only way to
+name a coroutine, and a counted reference conducts marks where a handle
+conducted none: a mutex reachable from any global marked its holder live,
+the waiter's row read "the holder is L-marked", and the row was satisfied by
+its own premise, so no mutex cycle was reportable on any pass. The field
+stays a counted reference, because the liveness rows read a *terminated*
+debtor out of it and the corpse must remain readable. `design/deadlock.md`
+owns the sentence, being the only reader of the field.
+
+**Thirty-two bits of generation stand, and the epoch argument that defended
+them is struck as circular** — the epoch a completion validates comes out of
+the slot itself, in this design and in the one before it, so it validated
+the current occupant against itself. What closes the wrap is a bound the
+corpus already contained: a slot still owed completions does not release,
+each reuse after release requires every worker to pass a quiescent point,
+and every comparison the substrate performs happens at the drain of the
+reading worker's current or next turn. The window admits a few hundred
+reuses where a false pass needs 2³². **This makes "no pool handle crosses
+the API" a load-bearing rule**, stated now rather than assumed; a surface
+that hands one out reopens the width question for that pool alone. The
+"generation width" open question is deleted.
+
+Left open by name: whether the collector's barrier discipline covers a
+counted reference handing off between two roots mid-pass, which joins the
+`ll-model` integration item rather than being decided here.

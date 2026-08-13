@@ -30,7 +30,9 @@ What is not detected:
 ## Terms
 
 A wait record holds one **entry** per thing a coroutine waits on: the
-resource handle, a cancel handle, a result slot, a fired bit. Beside the
+resource, named by its handle when it is pooled and by a counted reference
+otherwise (`design/execution.md`), a cancel handle, a result slot, a fired
+bit. Beside the
 entries the record carries the mode, the wait epoch, the winner field and
 `remaining` (`design/execution.md`). The kind is a property of the resource
 and is read from the resource itself — the class of a heap entity, the slot
@@ -41,18 +43,29 @@ A wait **edge** has two ends and neither is a record field. The coroutine's
 end names a resource. The resource's end answers who can end the wait, and
 it is read fresh at evaluation, because ownership moves: two coroutines
 park on mutex M and both record its holder, the holder releases M and
-finishes, its slot is reused, and the second record now names a stranger.
+finishes, and the second record still names a coroutine that owns nothing
+and will end no wait.
 
 ## Resources split three ways
 
 The kind decides the liveness rule and nothing else about a resource does.
 
-- **External** — a kernel operation, an armed timer. The kernel or the
-  wheel serves it without any coroutine.
+- **External** — a kernel operation, an armed timer, and the completion
+  queue of a socket a multishot operation appends to
+  (`design/reactor.md`). The kernel or the wheel serves it without any
+  coroutine.
 - **Debtor** — a mutex, a synchronous actor call, a join on a coroutine,
   and a semaphore whose permits are released only by dropping a permit
   guard. The resource names who owes it: the holder, the callee, the
-  target, or for the semaphore its permit holders and its free count.
+  target, or for the semaphore its permit holders and its free count. **That
+  field holds a counted reference** — counted so that a terminated debtor is
+  still there to be read, since the rows below distinguish one from a
+  running holder; traced by M like every counted reference here; crossed by
+  neither L nor the attribution walk. This document owns the sentence,
+  because it is the only reader of the field and the debtor resources have
+  no document of their own; a synchronisation-primitives document, when one
+  exists, inherits the execution half as `design/channels.md` carries the
+  supply half today.
 - **Supply** — a channel, a future, an actor mailbox, and any semaphore
   that can be posted without being acquired first. No owner field can
   exist, because whoever holds the write end may serve the wait. A future
@@ -105,7 +118,8 @@ check its own age, which is why the wheel holds the entry instead.
 
 **Only a wait that could be proved dead arms one.** Call an entry
 cycle-capable when it names a mutex, a semaphore, a channel, an actor, a
-future or a join; a kernel operation and a timer are not. Then:
+future or a join; a kernel operation, a timer and a socket's completion
+queue are not. Then:
 
 - an **OR** wait arms a watchdog when **every** entry is cycle-capable,
   because one kernel or timer entry satisfies an OR forever;
@@ -125,8 +139,12 @@ wait or an OR wait with a timeout, so a server with a hundred thousand
 idle connections arms nothing.
 
 **The last worker about to sleep requests a pass too**, when no operation
-is in flight, no timer is armed and every run queue is empty. This detects
-a total freeze at the moment it forms rather than a threshold later. The
+is in flight, no timer is armed and the shared ready set is empty. The last
+worker is the one whose idle bit completes the mask, and it reads the ready
+set's emptiness under the mutex it is about to release; no other worker's
+private lists are read, because a worker holding anything in its lists has
+not published its bit (`dev/DECISIONS.md`, 2026-08-13). This detects a
+total freeze at the moment it forms rather than a threshold later. The
 condition may be read racily, because a needless pass is only a pass. Go's
 `checkdead` is this trigger and only this one, which is why a cycle of
 three goroutines inside a running program is never found there.
@@ -157,20 +175,43 @@ One walk propagates two bits that differ in roots and in flow.
 
 **M, the memory mark.** Unchanged: every root the collector already has,
 including the scheduler's ownership table, the timer wheel and the reactor
-intake queues, flowing through everything.
+intake queues, flowing through everything. **No pool is a root.** The
+reference in an armed waiter cell names a unit the ownership table still
+registers, because a unit leaves that table only on its terminal transition
+and reaches it only by resuming, which requires the wait decided; and once
+the wait is decided the only cell emptied across threads is a socket's,
+whose pending retire is an intake entry carrying its own counted reference
+to the unit (`design/pool.md`, `design/reactor.md`).
 
 **L, the liveness mark.** Roots: globals, the C-ABI registered handle
-table, every coroutine that is not parked, every parked coroutine whose
-wait is already decided (winner claimed or `remaining` zero), and every
-coroutine named by a pending reactor-intake entry whose epoch matches.
+table, every coroutine that is neither parked nor `Terminal`, every parked
+coroutine whose wait is already decided (winner claimed or `remaining`
+zero), and every coroutine named by a pending reactor-intake entry whose
+epoch matches.
 
-L flows through every object except two. It does not flow out of the cells
-of a parked coroutine that is not itself L-marked, and it does not flow
-through the waiter-queue links of a supply resource; the attribution walk
-does not cross those links either. Both links are counted references and
-the memory mark traces them like any other, because a counted reference the
-tracer cannot enumerate is unsound here — an untraced queue could never
-have carried a counted one.
+A `Terminal` coroutine is excluded because it has finished and still
+exists: whoever armed an entry against it holds a counted reference
+(`design/execution.md`), so the object outlives its own completion. Rooting
+it would contradict the three rows below that call a terminated holder
+dead — a mutex it never released would mark its waiter live for as long as
+anything referenced the corpse.
+
+L flows through every object except three. It does not flow out of the cells
+of a parked coroutine that is not itself L-marked; it does not flow through
+the waiter-queue links of a supply resource; and it does not flow through
+the fields by which a debtor names its debtor — a mutex's holder, a
+guard-semaphore's holder list, an actor's current unit, a join's target. The
+attribution walk crosses neither of the last two kinds of link. All of them
+are counted references and the memory mark traces them like any other,
+because a counted reference the tracer cannot enumerate is unsound here — an
+untraced queue could never have carried a counted one.
+
+**A debtor row reads the named coroutine's own mark**, and a field that
+conducted L into it would satisfy the row from the row's own premise: a
+mutex held in any global would mark its holder live, its waiter would read
+"the holder is L-marked", and no cycle through that mutex could ever be
+reported. Nothing legitimately reads a debtor resource's own liveness, so
+cutting the flow costs nothing.
 
 **Beside the marks the pass collects the served set**, which is not a mark
 and does not propagate: a resource is *served* when a pending intake entry
@@ -211,14 +252,23 @@ An outstanding entry is live when:
 |---|---|
 | kernel operation | always: the kernel owns it |
 | timer | always: it is armed |
+| socket completion queue, multishot | always: the kernel appends while the series is armed, and between a series' end and the re-arm the reactor owes the re-arm (`design/reactor.md`) |
 | mutex | the holder is L-marked. **Dead, and no edge**, when the holder has terminated: a finished coroutine never releases |
 | semaphore, guard-released | the free permits plus the permits held by L-marked holders cover what the waiter asked for. **Dead, and no edge**, for a permit held by a terminated coroutine: teardown drops its guards and returns the permit, so a terminated holder still counted is a leak. One edge per dead holder of a needed permit |
-| semaphore, postable | the free permits cover the request, or the semaphore is served, or its handle is L-marked. Holders are not read: whoever reaches the handle can post |
+| semaphore, postable | the free permits cover the request, or the semaphore is served, or the semaphore object is L-marked — over the C ABI, its entry in the registered handle table. Holders are not read: whoever reaches it can post |
 | join | the target is L-marked or terminal, a terminal target's completion wake being in flight |
 | actor call | the callee's current unit is L-marked, or the callee's readiness word reads ready or running, or its mailbox is non-empty. The readiness word is load-bearing rather than a convenience: between the worker taking a message out of the mailbox and creating the unit for it, the other two clauses are both false, and without this one a healthy synchronous call is reported deadlocked (`dev/DECISIONS.md`, 2026-08-13) |
 | channel receive | the buffer is non-empty, or the channel is served, or the channel is closed, or the write end is L-marked |
 | channel send | the buffer has space, or the channel is served by a pending take, or the channel is closed, or the read end is L-marked |
 | future await | it is resolved or broken, or the future is served, or the promise is L-marked |
+
+**The socket queue's row could not read otherwise.** Calling it dead while
+the series is un-armed would require proving that no buffer ever frees,
+which a pass cannot know and which is false in the routine `-ENOBUFS` gap
+`design/reactor.md` describes: a pass landing in that gap would invent a
+deadlock against a loaded, healthy connection. The one state this row
+cannot report — a waiter over a queue the reactor can never re-arm — is a
+fact the reactor already holds, and the reactor publishes it.
 
 **Closed** is read as the closed flag or the relevant end count at zero —
 write ends for a receive or an await, read ends for a send
@@ -397,8 +447,10 @@ Threads: **K** the collector, **O** an owner thread, **W** any worker.
     value and the report handle.
 12. **(O, reactor drain)** If state, epoch, winner and fired bits match — and,
     for a supply entry, if the resource's own fields still read as they did:
-    store the error as the result, claim the wait as decided, retire every
-    outstanding entry through its cancel handle, store `Woken`, enqueue.
+    store the error and the report handle in the record's own result slot,
+    claim the winner with the reserved no-entry value (`design/execution.md`),
+    retire every outstanding entry through its cancel handle, store `Woken`,
+    enqueue.
     The owner-side re-read costs one read per resolution, and resolutions are
     rare; it is what makes a deposit that landed during the pass authoritative
     over a verdict built on its absence.
@@ -483,8 +535,9 @@ knob and it selects the victim rather than the policy.
   that turns live; an intake scan proportional to pending entries.
 - **Per trigger:** one collector epoch that would not otherwise have run.
   This is the real cost of the design, bounded by the watchdog's doubling.
-- **Never:** a scan of the pools. That exists for the human-facing
-  diagnostic dump and is not on this path (`design/pool.md`).
+- **Never:** a scan of the pools, by either mark. The walk of slot headers
+  exists for the human-facing diagnostic dump and is on neither path
+  (`design/pool.md`).
 
 No figure is claimed. Latency is the threshold plus the walk for a partial
 deadlock, and the walk alone for a total freeze.
@@ -494,7 +547,7 @@ deadlock, and the walk alone for a total freeze.
 | Question | Document |
 |---|---|
 | the wait record, the epoch, the parked state, the wake order | `design/execution.md` |
-| slots, resources and their owners | `design/pool.md` |
+| which waitable resources are pool slots, and where the rest live | `design/pool.md` |
 | delivering a failure to a coroutine, and the foreign-frame count | `design/cancellation.md` |
 | what an operation waiting in the kernel means | `design/reactor.md` |
 | why the detector runs inside the collector | `dev/DECISIONS.md`, 2026-08-12 |
@@ -509,7 +562,14 @@ deadlock, and the walk alone for a total freeze.
   for single counted cells: none of the three is checked against
   `run_epoch` and the steppable collector. The fallback is a detector-owned
   second traversal of parked coroutines inside the same pass, which changes
-  this document's cost section and not its protocol.
+  this document's cost section and not its protocol. **A fourth item joins
+  them**: a counted reference hands off between two roots mid-pass, from an
+  armed waiter cell to the intake entry of a cross-thread retire
+  (`design/pool.md`). Whether the barrier discipline that covers any root
+  mutation covers this one is the same unverified question, and if
+  `ll-model` requires every counted in-edge enumerated per object, the
+  cell's reference is enumerated at the unit's own record — one in-edge per
+  outstanding entry naming a pooled resource.
 - **The intake queue's ordering contract is owed by `design/reactor.md`**,
   which today describes the queue as carrying cross-thread cancels and
   migrated submissions and says nothing about order. Step 12 and the served

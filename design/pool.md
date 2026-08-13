@@ -37,9 +37,9 @@ Pools exist for three reasons, and only the first is about allocation:
 
 Resolving a handle checks the slot index against the pool's current
 extent, computes the slot's address from the slab table, and compares the
-generation. A stale handle — a wake for an operation whose unit finished,
-a cancel for a unit that completed — fails the comparison and does
-nothing.
+generation. A stale handle — a completion for an operation whose slot was
+released and handed out again, a cancel naming a timer that already
+fired — fails the comparison and does nothing.
 
 **A handle names a pooled object and nothing else.** A coroutine and an
 actor are named by counted references: whoever arms an entry of a wait holds
@@ -76,20 +76,36 @@ slot from the next. A coroutine's wait epoch is a different counter in a
 different place: it distinguishes one wait of one coroutine
 (`design/execution.md`), and nothing in a pool reads it.
 
-**Thirty-two bits wrap.** A slot recycled ten thousand times a second
-wraps in about five days, and this design deliberately lets an operation
-outlive the unit that submitted it, so a completion can be in flight for a
-long time. Wrapping is survivable only because a stale completion must also
-pass the epoch check of the wait its operation names; it is not proof, and a
-64-bit generation with a narrower slot index is the fallback if the argument
-turns out to be thin.
+**Thirty-two bits wrap, and wrapping is harmless, because a comparison only
+ever spans a bounded window.** A slot still owed completions, or held
+through a pending cancel, does not release at all, so its generation is
+frozen while its handle is legitimately in use. After a release, each reuse
+requires every worker — the eventual reader included — to pass a quiescent
+point, and every comparison the substrate performs happens at the drain of
+the reading worker's current or next turn: an undrained completion this
+turn, a posted retire or cancel the next, an inline use at once. The window
+therefore admits a few hundred reuses of one slot where a false pass needs
+exactly 2³².
+
+**This holds because no pool handle crosses the API**, and that is now a
+rule rather than an accident: the reactor's calls take descriptors, and the
+C-ABI surface hands out counted objects and descriptors and no pool name. A
+consumer-retained handle would have an unbounded staleness window and would
+alias in days at the recycle rate above. A surface that hands one out
+reopens the width question for that pool alone, and a wider generation
+behind that pool's nibble is the answer there rather than a global widening.
+
+The wait epoch is not part of this argument and never was. It tells one
+wait of one coroutine from the previous one, and the completion carries no
+epoch of its own to check — the epoch it validates comes out of the slot's
+own waiter cell.
 
 ## Reclamation is deferred, and that is what makes waking safe
 
 A completion resolves an operation's handle and then reads the slot: the
-waiter it names, the entry index, the epoch to validate. Resolving and
-reading are not one atomic step, so between them the operation may take its
-last owed completion and its slot may be released.
+owed count, the buffer it pins, the waiter cell. Resolving and reading are
+not one atomic step, so between them the operation may take its last owed
+completion and its slot may be released.
 
 **A released slot is not handed out again until every worker has passed a
 quiescent point after the release.** Workers are quiescent between
@@ -106,6 +122,10 @@ The generation is what rejects a read that arrives *after* reuse; the
 deferred reclamation is what rejects one that arrives *during* it. Both
 are needed, and the earlier design had only the first.
 
+**Both serve handle resolution and the dump, and neither serves the wake
+path**, which no longer needs them: a waiter cell has one thread, so a
+completion never loads a reference another thread is dropping.
+
 ## Walking a live pool
 
 A walker iterates slabs and slots, reads each header with an acquire load,
@@ -116,10 +136,20 @@ detector can report: a write end held by live code that never writes
 liveness over the collector's object graph — so the rules below serve the
 dump alone.
 
+**The collector reads nothing in a pool either.** An armed cell's unit is
+reachable through the scheduler's ownership table while its wait is
+undecided, and through the intake entry of a pending cross-thread retire
+afterwards; both are roots the collector already has, so no scan of slabs
+covers a cell (`design/deadlock.md`, `dev/DECISIONS.md`, 2026-08-13). A
+scan that did would be this walk, whose first rule is that it may miss a
+slot.
+
 **What a validated read guarantees, exactly:** that at some instant between
 the two header loads, this slot held this occupant in this state. It
 guarantees nothing before or after that instant, and nothing at all about
-any other slot.
+any other slot. **The dump never follows a waiter cell**: a validated read
+licenses the header and nothing behind it, and the reference in the cell
+belongs to the slot's own thread.
 
 Two rules follow:
 
@@ -161,9 +191,34 @@ document and not here.
 | Group | Contents |
 |---|---|
 | header | `state`: submitted, result received, awaiting notification, cancelling |
-| target | the waiter's handle, the entry index, the epoch to validate |
+| waiter cell | a counted reference to the waiting unit, the entry index, the epoch to validate — or empty |
 | memory | the buffer handle it pins, and the buffer's registered index if it has one |
 | accounting | how many completions the kernel still owes |
+
+**The waiter cell has one writer, one emptier and one thread**, and that
+thread is the slot's owner. For an operation and a timer it is the unit's
+own thread, because arming submits to this worker's own ring and wheel
+(`dev/DECISIONS.md`, 2026-08-13), so the cell is written at step 2 of the
+parking protocol. The same worker empties it, at whichever of two events
+comes first. The completion carrying the operation's result
+takes the reference out of the cell and moves it into the `wake` it calls,
+and whoever consumes that payload drops it, exactly as a channel node's
+reference moves (`design/channels.md`). Retiring the entry empties the cell before the
+kernel cancel is submitted. Applied inline when the wait ended on this
+worker, it drops the reference there and then. **A cross-thread retire drops
+nothing where it runs**: the request carries a counted reference of its own,
+taken by the poster on the unit's thread, and the applier moves the cell's
+reference into the confirmation it posts back, so both come home to be
+dropped where the count belongs. No thread ever decrements a count it does
+not own, which is the shape the completion path already has. A retire that
+finds the result already received submits no kernel cancel, there being
+nothing left to hasten.
+
+Two slots hold no waiter cell of their own. **A multishot operation names
+the socket's handle and never a unit**, because the unit re-parks between
+chunks (`design/reactor.md`); the reference for a wait on that queue sits
+in the socket slot's queue-waiter cell, which is a cell of this kind. **A
+cancel operation** names the operation it cancels and no waiter at all.
 
 **An operation is not released on its first completion**, because the
 kernel does not always owe exactly one:
@@ -176,58 +231,49 @@ kernel does not always owe exactly one:
   cancel's, and the cancel is a separate operation with a separate slot
   (`design/cancellation.md`).
 
-The slot is released, and its buffer unpinned, when the owed count
-reaches zero and not before.
+The slot is released, and its buffer unpinned, when the owed count reaches
+zero and not before. **A completion arriving at an empty waiter cell calls
+no `wake`**: it adjusts the owed count, applies its buffer rule, and
+releases the slot if the count reached zero. Slot release involves no unit,
+which is what keeps an operation abandoned against a hung mount from
+outliving anything but its buffer and its slot (`design/cancellation.md`).
 
-### Resource
+### Where a waitable resource lives instead
 
-A resource a unit can wait on answers who can end that wait, and there are
-three kinds of answer (`design/deadlock.md`).
+Three of the things a wait entry can name are pool slots, and all three are
+the external kind: an operation, ended by the kernel; a timer, ended by the
+wheel; and a socket, whose completion queue a multishot operation appends
+to (`design/reactor.md`, `design/deadlock.md`). None holds an owner field,
+because none of those waits is ended by a coroutine, and the `kind` byte of
+the slot is what the detector reads to pick the rule.
 
-**An external resource is ended without any unit** — an operation by the
-kernel, a timer by the wheel — so it holds no owner field and closes no
-cycle.
-
-**A debtor resource names its owner in a field:**
-
-| Resource | Owner field |
-|---|---|
-| mutex | the unit holding it |
-| semaphore, guard-released | its permit holders and its free count |
-| actor, for a synchronous call | the unit processing its current message, or none |
-| join | the unit being waited for |
-
-The semaphore is a debtor only while its permits are released by dropping a
-guard, which is what ties a release to an acquisition. One that anyone may
-post without acquiring first — every semaphore reached over the C ABI —
-belongs with the channels below (`design/deadlock.md`).
-
-A wait record names the resource; the resource names its owner, read fresh
-by whoever asks. That indirection is what keeps an edge true when a mutex
-changes hands and the previous holder's slot is reused.
-
-**A channel and a future name nobody.** Whoever holds the write end may
-serve the wait, so no owner field can be right, and a registry of senders
-would answer a question nobody asks: the detector needs who can still
-reach the write end, which is reachability and not a field. What such a
-resource does carry is its own state — buffer occupancy, the closed or
-broken flag — and the rule that dropping the last write end closes it.
-
-A consumer that builds a resource of its own over the C ABI takes on the
-contract of its kind: a mutex keeps its owner field truthful, a channel
-holds its write ends in the registered handle table, and a semaphore either
-declares guard discipline and a truthful holder list or is treated as
-postable and therefore always live. Nothing checks any of it, and the
-detector's promise never to invent a deadlock rests on all three.
+Every other resource a unit can wait on is an entity of the memory manager
+or of the thread's heap, and its kind is read from its class rather than
+from a slot header. A mutex, a join, a synchronous actor call and a
+semaphore whose permits are released only by dropping a guard name one
+owner and are debtors; a channel, a future, an actor's mailbox and a
+semaphore anyone may post name nobody, because whoever holds the write end
+may serve the wait. Which fields each exposes, and how a consumer that
+builds one over the C ABI keeps its answers truthful, belong to
+`design/deadlock.md` and to `design/channels.md`; nothing about them is
+decided here.
 
 ### Buffer, socket, timer
 
 A buffer slot is a header, a length, the registered index if the pool is
 registered, and the payload. A socket slot is a header, the descriptor or
 its registered index, and the head and tail of the queue a multishot
-operation appends to (`design/reactor.md`). A timer slot is a header, a
-deadline, and the waiter's handle with its entry and epoch. None of them
-carries a wait record: only units wait.
+operation appends to, plus the queue-waiter cell a unit parking on that
+queue writes (`design/reactor.md`). A timer slot is a header, a deadline
+and a waiter cell. All three cells obey the same invariant, and it is *one
+thread* rather than *the waiting unit's thread*: the cell belongs to the
+worker that owns the slot, which for an operation and a timer is the
+worker that submitted or armed it, and for a socket's queue-waiter cell is
+the worker whose ring carries the multishot. A unit parked from any other
+worker reaches the cell through that worker's intake queue, and the
+park-time recheck of the queue is performed by whichever thread writes the
+cell, immediately after the write (`design/reactor.md`). None of these slots carries a wait
+record: only units wait.
 
 ## Allocation and release
 
@@ -290,7 +336,8 @@ one.
 | stacks, which are not pool slots | `design/stacks.md` |
 | buffer contracts and registration | `design/reactor.md` |
 | when an operation stops being owed completions | `design/cancellation.md` |
-| what a walk concludes, and set-level re-validation | `design/deadlock.md` |
+| what a walk concludes, set-level re-validation, the three resource kinds | `design/deadlock.md` |
+| channels, futures, and what each exposes to the detector | `design/channels.md` |
 
 ## Open questions
 
@@ -299,8 +346,6 @@ one.
 - **The kernel floor for sparse buffer registration**, and whether the
   fallback for a grown pool is per-slab registration.
 - **Partitioning the buffer index namespace** across size classes.
-- **Generation width.** Thirty-two bits wrap in days at a high recycle
-  rate, and the argument that the epoch covers the wrap is not a proof.
 - **Reclaiming slabs.** Never freeing is right for a server and wrong for
   a process that peaks once. Deregistration before unmapping is a global
   operation on some backends, which is what makes it hard.

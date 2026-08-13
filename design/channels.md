@@ -403,7 +403,8 @@ before the block is freed.
 A shared channel is the only kind that crosses. The value is in the buffer
 before any wake exists, and the wake goes inline if the waiter belongs to this
 thread and to the owner's intake queue otherwise, because a coroutine is touched
-only by its own thread (`design/reactor.md`).
+only by its own thread (`design/execution.md`); the intake queue itself is
+`design/reactor.md`'s.
 
 **A same-thread send applies the wake inline** rather than posting to its own
 intake queue, which also keeps the duty on this thread where the walk can
@@ -494,7 +495,8 @@ holder list truthful enough to name a debtor.
 Anything reached over the C ABI counts as postable regardless of what it
 claims, because its discipline is not ours to see, and a postable semaphore is
 a supply resource: live when its free permits cover the request, or it is
-served, or its handle is L-marked. A semaphore created with zero permits and
+served, or the semaphore object is L-marked — for one reached over the C
+ABI, its entry in the registered handle table. A semaphore created with zero permits and
 posted by a producer that never acquired anything has no holders at all, so
 calling it a debtor would report its waiter deadlocked while the producer runs.
 A post raises the same duty a deposit does, and discharges it by the same rule.

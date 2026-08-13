@@ -125,12 +125,31 @@ unit-scoped validation would discard everything after the first. The
 queue's entries come from a pool of completion records, with head and tail
 in the socket slot, so a fixed-size slot holds an unbounded series.
 
-**Parking on the queue is an ordinary park with a recheck.** The unit
-writes its wait record naming the socket, publishes itself as the queue's
-waiter, and then re-reads the queue: non-empty means abandon the
-suspension and continue. Without that recheck a completion landing between
-the drain and the park sees no waiter, appends, and nobody ever looks
-again — the unit sleeps over a full queue.
+**Parking on the queue is an ordinary park with a recheck, and the recheck
+belongs to whoever writes the queue-waiter cell.** Without it a completion
+landing between the drain and the park sees no waiter, appends, and nobody
+ever looks again — the unit sleeps over a full queue.
+
+**The cell belongs to the worker whose ring carries the multishot**, which
+is the worker that drains these completions, so one thread writes it, reads
+it and empties it (`design/pool.md`). Two paths follow from that:
+
+- **The ring's own worker** writes the cell at park and re-reads the queue
+  inline. Non-empty means it empties the cell again and abandons the
+  suspension, which is the ordinary inline satisfaction of
+  `design/execution.md`.
+- **Any other worker** posts the publish to the owner's intake queue and
+  suspends without reading the queue at all, that being another worker's
+  memory. The owner writes the cell when it drains the entry, re-reads the
+  queue, and on non-empty moves the reference out of the cell into an
+  ordinary `wake`, which dispatch forwards back to the unit's worker.
+
+The append reads the cell after appending and the publish reads the queue
+after writing the cell, both on the one thread that owns the slot, so
+whichever runs second sees the other's first half. A unit's own remote
+re-read would order nothing, because it precedes the publish it exists to
+defend. The intake queue carrying the publish is one more consumer of the
+ordering contract this document still owes for that queue.
 
 **The series ends routinely, and the reactor re-arms it.** Multishot
 terminates when the provided-buffer ring runs dry with `-ENOBUFS` and when
@@ -140,11 +159,23 @@ appended to the queue as an entry of its own, and the reactor resubmits
 the operation as soon as a buffer is available. A consumer sees a gap in
 the stream, never a silent stall.
 
+**A series that cannot be re-armed is the reactor's to report.** A socket
+whose series ended and whose re-arm has no buffer sits in the reactor's
+re-arm list with the time the series ended; an entry older than the
+threshold is published to the diagnostic channel of `design/deadlock.md`
+together with the buffer pool's state, and a counter of starved re-arms
+separates a quiet system from one that cannot feed its sockets. The
+detector reports none of this: the liveness row for a wait on the queue
+reads always live, because a pass cannot prove that no buffer ever frees.
+
 **Draining on death.** When a socket closes or its waiting unit ends,
 every queued entry is drained: provided buffers go back to the ring and
 accepted descriptors are closed. A multishot accept yields descriptors
 rather than buffers, so the two cases need different drains and both are
-the socket slot's responsibility.
+the socket slot's responsibility. **A close also empties the queue-waiter
+cell into a `wake` carrying the close error**, and the liveness row rests on
+it: a waiter over a queue whose socket closed is failed by this path and by
+nothing the detector does (`design/deadlock.md`).
 
 The queue is bounded by a watermark; above it the reactor stops re-arming
 and lets the kernel's own socket buffers apply backpressure. The number is
@@ -279,6 +310,8 @@ and the caller decides.
 - **Registration lifetime.** Growing a pool by a slab needs a sparse
   registration and an update call, whose kernel floor and cost are not
   established (`design/pool.md`).
+- **The re-arm starvation threshold**, a deployment parameter with no
+  measurement, like the detector's.
 - **The multishot queue watermark**, and what backpressure means on the
   emulating backends, where a level-triggered readiness series never ends
   on its own.

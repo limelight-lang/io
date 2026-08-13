@@ -48,12 +48,18 @@ reaching the substrate over the C ABI gets stackful units and no choice
 compile cannot be polled without an agreed layout, and a poll that meets
 a foreign frame has nowhere to return `Pending` to.
 
-## One handle, two kinds
+## One reference, two kinds
 
 The scheduler queues one thing: a counted reference to a unit. Whoever
 arms an entry of a wait holds one too, so the unit cannot be freed
-underneath a wake that is still on its way. The suspension kind is a
-field of the unit, which dispatch reads anyway.
+underneath a wake that is still on its way. That reference is in exactly
+one place at a time: the resource's waiter cell while the entry is armed —
+an operation, timer or socket slot (`design/pool.md`), a waiter node of a
+channel (`design/channels.md`) — and the wake payload afterwards, dropped
+by whoever consumes it. During a pending cross-thread retire there are
+transiently two: the cell's and the request's own, and both come home to be
+dropped on the unit's thread (`design/cancellation.md`). The suspension
+kind is a field of the unit, which dispatch reads anyway.
 
 The wake path never inspects the kind: it moves a reference to a run
 queue. Dispatch reads the kind once, on mount, and branches to one of two
@@ -94,7 +100,7 @@ from the compiler that produced it:
 
 | Item | Meaning |
 |---|---|
-| size, alignment | how much storage the unit's slot must provide |
+| size, alignment | how much storage the state's own allocation must provide |
 | `poll(state, waker) -> Ready(value) \| Pending` | resume; run until the next suspension or completion |
 | `drop(state)` | release the state and everything it owns |
 | `is_thread_affine` | whether the state may hold thread-local addresses; see the pinning rule |
@@ -147,8 +153,13 @@ stores and the wake that could once arrive mid-suspension cannot.
    returns `Pending` from `poll`.
 4. **Mark `Parked`.** After the switch has completed, or after `poll` has
    returned, the worker stores `Parked` — unless the cancelled bit is set, in
-   which case it retires the entries, stores `Woken` and enqueues instead
-   (`design/cancellation.md`). Retiring there is what unlinks the nodes this
+   which case it stores the cancellation in the record's own result slot,
+   claims the winner with the reserved no-entry value, retires the entries,
+   stores `Woken` and enqueues instead (`design/cancellation.md`). It claims
+   before it retires for the same reason the cancel path does: retirement is
+   asynchronous, and an entry armed at step 2 that fires afterwards is
+   rejected by the claim and by nothing else, the epoch being the one just
+   written. Retiring there is what unlinks the nodes this
    wait put into resource queues; a unit that leaves them behind is a channel
    waking a coroutine that has since parked on something else. It is the worker rather than the
    unit because a unit that announced itself parked while its machine
@@ -188,11 +199,29 @@ retired protocol is the design for that day.
 | `Running` | mounted on a thread and executing |
 | `Parked` | the suspension is finished and the unit is waiting |
 | `Woken` | a wake has been accepted; the unit is owed one run queue slot |
+| `Terminal` | teardown has begun; nothing will run on this unit again |
 
 Every transition is a plain store, because one thread performs all of
 them. There were four states and a compare-and-swap on each while a wake
 could arrive from another thread; that case is gone, and `Parking` went
 with it.
+
+**`Terminal` is not a parking state**: the first three describe a unit that
+still has code to run, and this one says it has none. It exists because the
+object outlives its own completion — whoever armed an entry holds a counted
+reference, so a finished unit is still there to be asked — and because
+`design/deadlock.md` distinguishes a terminated holder from a running one
+in three of its liveness rows. No generation answers that question now
+(`dev/DECISIONS.md`, 2026-08-12).
+
+**It is stored at one point of teardown**: after the unit's own code has
+finished — the stack unwound, or `drop(state)` returned for a stackless
+unit — and before the wait record is released. Earlier would report a unit
+as terminated while a guard in its frames still holds a mutex, and
+`design/deadlock.md` treats a terminated holder as one that never releases,
+so an ordinary unwind would be read as a deadlock. Later would let a
+retired completion pass step 0 and read the epoch out of a record that has
+been freed.
 
 **`Woken` means the wait is decided**, and that equivalence is load-bearing
 elsewhere: whoever moves `Parked → Woken` has already claimed the winner of
@@ -214,6 +243,7 @@ thread" means the thread the word names.
 | `Running` | `Parked` | the worker, after the suspension has finished |
 | `Parked` | `Woken` | whoever ends the wait; it also enqueues |
 | `Woken` | `Running` | the scheduler, mounting and resuming |
+| `Running` | `Terminal` | the worker, once the unit's own code has finished; nothing leaves `Terminal` |
 
 **Exactly one enqueue per wake**, because exactly one caller moves
 `Parked → Woken` and a second finds `Woken` already set and returns.
@@ -228,11 +258,20 @@ its actor's thread, and a signal from elsewhere reaches the reactor rather
 than the unit. It does five things in order, behind one dispatch.
 
 0. **Dispatch on the state word**, once, before anything else reads the
-   record. The word names this thread, another worker, `WokenShared` or
-   `Terminal`, and only the first case continues into step 1; the others
-   forward the payload to the named worker's intake queue, or drop it
-   (`dev/DECISIONS.md`, 2026-08-13). Dispatch stands ahead of the epoch check
-   so that no foreign thread ever reads the epoch.
+   record, with four outcomes (`dev/DECISIONS.md`, 2026-08-13). The word
+   names **this thread**: continue into step 1. It names **another worker**:
+   forward the payload to that worker's intake queue. It reads
+   **`WokenShared`**: drop a wake and drop a conditional resolution, since
+   the wait is already decided, but write the cancelled byte for a cancel —
+   no worker owns the unit, and the one that wins the mount inherits the bit
+   — and then re-read the word, because a single load orders nothing
+   against the mount, so the answer follows the re-read
+   (`design/cancellation.md`). It reads **`Terminal`**: drop the signal and
+   release what it carried — releasing means *answering*, not discarding,
+   for a cancel request, whose promise is resolved *already finished* here
+   rather than broken by a dropped handle (`design/cancellation.md`).
+   Dispatch stands ahead of the epoch check so that no foreign thread ever
+   reads the epoch.
 
 1. **Validate the epoch.** Compare the record's epoch with the argument.
    A mismatch means this entry was retired and the unit has since parked
@@ -243,11 +282,14 @@ than the unit. It does five things in order, behind one dispatch.
    The unit itself cannot be gone: whoever armed the entry holds a
    counted reference to it, so it is alive for as long as the wake can
    arrive.
-2. **Store the result** into that entry.
-3. **Decide whether the wait is over.** A caller that finds the wait
-   already decided returns here, before the counter is touched: a retired
+2. **Store the result** into that entry, and only into it.
+3. **Decide whether the wait is over.** *Already decided* means the winner
+   field is claimed or `remaining` has reached zero, and a caller that
+   finds either returns here, before the counter is touched: a retired
    entry firing after `remaining` reached zero would otherwise drive it
-   negative, and no reader is prepared for that. Under **OR**, claim the
+   negative, and no reader is prepared for that. Step 2 stands ahead of
+   this one because under AND a caller that does not reach zero returns
+   here, and its result has to be stored before it does. Under **OR**, claim the
    winner field; a caller that finds it claimed returns. Under **AND**,
    decrement `remaining`; a caller that does not take it to zero returns.
 4. **Retire the other entries** through their cancel handles. Retirement
@@ -284,22 +326,41 @@ wait. It carries one entry per thing the unit waits on:
 
 | Field | Meaning |
 |---|---|
-| resource | the handle of what is being waited on: a mutex, a channel, an actor, an operation, a timer |
+| resource | what is being waited on: a mutex, a channel, an actor, a join, an operation, a timer. A pooled one is named by its handle, everything else by a counted reference |
 | cancel | an opaque handle that ends this entry early |
 | result | where the waker stores what the unit will read |
 | fired | whether this entry has already been satisfied |
 
 **The record names a resource, not the unit that will end the wait.** What
 the resource answers depends on its kind: a mutex or an actor names one
-owner in a field, read fresh when anyone asks (`design/pool.md`), while a
-channel or a future names nobody and is answered by reachability
-(`design/deadlock.md`). Naming a unit directly goes stale the
-moment a resource changes hands: two units parked on one mutex both record
-its holder, the holder releases it and finishes, its slot is reused, and
-the second waiter's record now names a stranger.
+owner in a field, read fresh when anyone asks, while a channel or a future
+names nobody and is answered by reachability (`design/deadlock.md`). Naming
+a unit directly goes stale the moment a resource changes hands: two units
+parked on one mutex both record its holder, the holder releases it and
+finishes, and the second waiter's record still names a coroutine that owns
+nothing and will end no wait.
 
-and, once per record: the mode, `remaining` for AND, the winner field for
-OR, and the `epoch` that every armed entry carries.
+and, once per record: the mode, `remaining` for AND, the winner field, and
+the `epoch` that every armed entry carries.
+
+**The winner field exists in both modes**, because a wait can end without
+any entry firing: a cancel ends one, and so does the detector's resolution
+(`design/cancellation.md`, `design/deadlock.md`). Neither may reach that
+end by writing `remaining`, because a counter another hand drove to zero is
+indistinguishable from one the last entry drove there, and the entries are
+still armed at that moment. Under OR the winner is the entry that fired
+first. Under AND it stays unclaimed while the counter runs down, and
+whoever does claim it has decided the wait outright.
+
+**Beside the winner field the record carries one result slot of its own.**
+A wait decided by no entry — a cancel, or the detector's resolution — stores
+its error there and claims the winner with a reserved value no entry index
+takes. An entry's result slot therefore keeps one writer, the wake that ends
+that entry, which is why a retired entry firing late writes into storage
+nobody reads. A resumed unit reads the winner field first: an entry index
+points it at that entry's result, the reserved value at the record's own
+slot, and an AND wait with the winner unclaimed means every entry is to be
+read.
 
 **Who can end a wait is answered by the resource, and how it answers
 depends on its kind** (`design/deadlock.md`). A mutex names its holder, an
@@ -352,6 +413,14 @@ state word reads `WokenShared`, the mounting worker compare-exchanges it to
 `Running(W)` with acquire semantics, paired with the release store that put it
 there, and installs the arena only after winning
 (`dev/DECISIONS.md`, 2026-08-13). Whoever loses does not mount.
+
+**Four accesses to a declared actor's word and byte are sequentially
+consistent**: this compare-exchange, a canceller's store of the cancelled
+byte, a canceller's re-read of the word, and park step 4's read of the byte.
+Acquire and release alone leave the cancel unordered against the mount, so a
+byte stored after step 4 has read it is never read again
+(`design/cancellation.md`). For every other unit the byte stays a plain
+store on one thread.
 
 The hooks fire when a unit is mounted on a thread and when it leaves,
 never per `poll` of a stackless unit. A stackless unit installs no actor
@@ -480,14 +549,15 @@ That is the whole reason the stackful kind is the default.
                          ▼                        │
 create ──▶ queued ──▶ Running ──┬──▶ Parked ──▶ Woken
                                 │
-                                └──▶ complete ──▶ teardown ──▶ released
+                                └──▶ complete ──▶ Terminal ──▶ released
 ```
 
-`Woken` returns to `Running` through the run queue; `released` is
-terminal.
+`Woken` returns to `Running` through the run queue. `Terminal` is teardown:
+the state word says so from the moment the unit's own code has finished,
+and `released` is the free that follows the last reference dropping.
 
-There are three states and no fourth. A wake that arrives while the unit
-is still suspending does not exist, because only the unit's own thread
+There are three parking states and no fourth. A wake that arrives while the
+unit is still suspending does not exist, because only the unit's own thread
 touches it: the wake is delivered to that thread's reactor and applied
 after the unit is `Parked` (`dev/DECISIONS.md`, 2026-08-12). `Parked →
 Woken` is enqueued by the waker, re-enters `Running` through the run
@@ -499,9 +569,14 @@ the stack pool (`design/stacks.md`), then enqueues it. That is a third
 enqueue, and it is not part of the wake invariant: the unit has no wait
 record yet and no waker can name it.
 
-Completion runs the consumer's unmount hook with reason `Boundary`,
-releases the wait record, returns the stack, and drops the scheduler's
-reference; the object is freed when the last reference goes. The stack
+Completion runs the consumer's unmount hook with reason `Boundary`, stores
+`Terminal`, wakes whoever joined on it, releases the wait record, returns
+the stack, and drops the scheduler's reference; the object is freed when the
+last reference goes. The store sits where it does because everything the
+unit's frames owned has been released by then and the record has not yet
+been. The join wakes follow it rather than precede it, which is what lets
+`design/deadlock.md` read a terminal target as live: a pass that sees
+`Terminal` knows the wake is already on its way. The stack
 needs no further condition because nothing the kernel may touch after
 submission lives on it: buffers and submission structures come from the
 buffer pool (`design/stacks.md`, `design/reactor.md`). Without that rule a
@@ -514,15 +589,24 @@ Cancelling a parked unit runs on the unit's own thread, the thread that
 parked it, and a cancel raised elsewhere is posted to that thread's
 reactor. On that thread the order is the wake protocol's, because a
 cancellation is a wake carrying an error and an implementation has one code
-path for both: store the cancellation as the result; decide the wait, which
-here means setting the cancelled bit and bumping the epoch so every armed
-entry goes stale; retire the entries through their cancel handles; store
-`Woken` and enqueue (`design/cancellation.md`). Every store is plain, and
-the state store is last for the same reason it is last in a wake. It does
-not go through `wake`'s entry index and
-counter, because an AND wait's counter would swallow it: a waker that does
-not take `remaining` to zero returns without waking, and a cancelled unit
-would sleep forever waiting for entries that were just retired.
+path for both: store the cancellation in the record's own result slot;
+decide the wait, which here means setting the cancelled bit and claiming
+the winner with the reserved no-entry value, in either mode; retire the
+entries through their cancel handles; store `Woken` and enqueue
+(`design/cancellation.md`). Every store is plain, and the state store is
+last for the same reason it is last in a wake. It does not go through
+`wake`'s entry index and counter, because an AND wait's counter would
+swallow it: a waker that does not take `remaining` to zero returns without
+waking, and a cancelled unit would sleep forever waiting for entries that
+were just retired.
+
+**The claim is what makes the retired entries harmless, and the epoch is
+not touched** — it is written once, in step 1 of the parking protocol
+(`dev/DECISIONS.md`, 2026-08-13). An entry that fires after the claim finds
+the wait decided and returns at step 3, whatever the mode; once the unit has
+parked again, step 1 rejects it on the epoch instead. Bumping the epoch here
+would give the record's identity a second writer and cover nothing the
+decided test does not.
 
 The bit is a modifier on the transitions that already exist, not a state
 of its own. It is set by the unit's own thread, because a cancel raised
@@ -544,11 +628,11 @@ victim instead of repeating itself (`design/cancellation.md`).
 
 ## Decided elsewhere
 
-All of these exist. Where any of them still describes the retired
-machinery — a handle carrying a slot and a generation, deferred slot
-reclamation, a compare-and-swap on every parking transition, a seqlock
-over the wait record — `dev/DECISIONS.md` of 2026-08-12 is what holds,
-and the correction is listed in `dev/INDEX.md`.
+All of these exist. The machinery an earlier version of this design used —
+a coroutine named by a 64-bit handle with a slot and a generation, a
+compare-and-swap on every parking transition, a seqlock over the wait
+record — appears here and there as history and nowhere as a rule;
+`dev/DECISIONS.md` of 2026-08-12 records what replaced it and why.
 
 | Question | Document |
 |---|---|
@@ -571,10 +655,10 @@ and the correction is listed in `dev/INDEX.md`.
   live and becomes migratable when it returns. Whether that is enough
   depends on what the library left in thread-local storage after
   returning, which we cannot inspect. The conservative alternative — pin
-  for life once a foreign frame has been entered — costs stealing for
-  every unit that ever calls out, so the narrower rule is what this
-  document states and the one that needs testing against real libraries
-  first.
+  for life once a foreign frame has been entered — costs the mid-message
+  move for every declaring actor that ever calls out, so the narrower rule
+  is what this document states and the one that needs testing against real
+  libraries first.
 - **Enforcing the TLS rule.** Stated above: no mechanism, only the absence
   of a reason to violate it, plus a migration test that does not exist
   yet.

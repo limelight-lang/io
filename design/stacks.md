@@ -280,9 +280,9 @@ pooling is the reason this document exists.
 | Question | Document |
 |---|---|
 | what a switch saves, the TEB swap, the shadow-stack swap | `design/switching.md` |
-| which units have stacks, and forced teardown | `design/execution.md` |
+| which units have stacks, and why a unit always ends itself | `design/execution.md` |
 | the buffer pool that holds everything the kernel touches | `design/reactor.md` |
-| the unit slot that points at a stack | `design/pool.md` |
+| the coroutine object that points at a stack | `design/execution.md` |
 
 ## Open questions
 

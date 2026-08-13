@@ -195,11 +195,49 @@ design document describes machinery that has been retired.
         (the channel row, with duty discharge). Two holes stay open by name: a
         write end the tracer cannot reach, and the intake queue's ordering
         contract.
-- [ ] S5.3 Apply the remaining corrections listed in `dev/INDEX.md`
+- [x] S5.3 Apply the remaining corrections listed in `dev/INDEX.md`
       done: the corrections table in `dev/INDEX.md` is empty and deleted,
         and the wait epoch has one rule instead of the three documents'
         two
-      tier: T2 · role: Critic
+      tier: T2 · role: Critic → Sage
+      Critic 2026-08-13 round 1, two fans. Correctness: the cancel path
+        claimed a wait with nothing to claim it in, since the winner field
+        existed under OR alone, so a retired entry firing later drove an AND
+        counter to zero and enqueued the unit twice; `Terminal` had no place
+        in teardown, and a terminated coroutine was an L root, which made its
+        waiter live forever. Completeness: 25 findings, mostly stale
+        citations — work stealing, forced teardown, the unit slot, the
+        detector reading the pools. All accepted; the six against
+        `dev/ARCHITECTURE.md` were left to S5.4, which rewrites that file.
+      Sage 2026-08-13 round 1: a slot names its waiter through a waiter cell
+        with one writer, one emptier and one thread, emptied by the
+        completion or by the retire; a multishot names the socket and never a
+        unit; the cells are memory roots. A cross-thread cancel carries a
+        promise the applying worker resolves, and a cancel in `WokenShared`
+        is the cancelled byte. Final.
+      Critic 2026-08-13 round 2: thirteen more against the fixes, one
+        critical. The cell root was a slab walk licensed to miss slots; the
+        counted reference in a debtor's owner field conducted L, so no mutex
+        cycle was reportable at all; the generation-wrap argument had become
+        circular; the socket queue had no liveness row; the multishot recheck
+        ran before the publish it defended; a cancel had nowhere to store its
+        error but an entry, which the next wake overwrote.
+      Sage 2026-08-13 round 2, two calls, both Final. Protocol: the record
+        gains its own result slot and a reserved winner value; a
+        `WokenShared` cancel writes the byte, re-reads the word and answers
+        from the re-read; the socket queue reads always live and the reactor
+        reports re-arm starvation; the recheck belongs to whoever writes the
+        cell. Memory: struck its own root sentence — the ownership table
+        covers an undecided wait and an intake entry covers the one
+        cross-thread retire, so no pool is a root; L stops at a debtor's
+        owner field; 32 bits of generation stand on the quiescence bound,
+        which makes "no pool handle crosses the API" load-bearing.
+      handoff: the corrections table and the epoch disagreement are gone from
+        `dev/INDEX.md`, whose corrections section is deleted; `design/pool.md`
+        no longer describes channels, semaphores or units, and owns the waiter
+        cell instead. Three `dev/DECISIONS.md` entries of 2026-08-13 carry the
+        rulings, the third striking a sentence of the first. Nothing is
+        committed: the working tree holds all of it.
 - [ ] S5.4 `dev/ARCHITECTURE.md` from provisional to real
       done: every module row names its files, its public types and what
         crosses its boundary; no row rests on retired machinery

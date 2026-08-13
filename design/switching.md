@@ -160,24 +160,31 @@ Its readers are three, and all of them are safety-critical:
 | Reader | What a wrong value costs |
 |---|---|
 | the switch | narrows with foreign frames live: corrupted foreign registers |
-| migration (`design/execution.md`) | steals a unit holding `errno` and other thread-local state |
-| forced teardown (`design/execution.md`) | unwinds through a frame not compiled for it |
+| re-mounting an actor (`design/execution.md`) | moves a unit holding `errno` and other thread-local state to another thread |
+| cancellation (`design/cancellation.md`) | reports a unit below a live foreign frame as cancellable when it is not |
 
 Because the last two readers are about safety rather than speed, a unit
 that opts out of maintaining the counter does not opt out of its value:
-its counter reads as permanently non-zero, so it never narrows, never
-migrates and is never force-killed. Opting out buys back two instructions
-per foreign call and costs work stealing, which is the right trade only
-for a consumer whose calls are nearly all foreign.
+its counter reads as permanently non-zero, so it never narrows and never
+moves, every cancel against it is answered *pinned* even where no foreign
+frame is live and the bit would in fact take effect at the next park, and
+the detector never chooses it as a victim (`design/deadlock.md`). That last
+one is the cost worth naming: a cycle with an opted-out unit in it is
+reported and never resolved, so a soft-resolvable deadlock becomes a hang
+with a report. Opting out buys back two instructions per foreign call, and
+an actor that declares the mid-message move may not also opt out
+(`dev/DECISIONS.md`, 2026-08-13); for anything else the trade is right when
+the calls are nearly all foreign and nothing depends on resolution.
 
 ## The saved context, the restore, and the first resume
 
-**Where the context lives.** At the top of the unit's own stack, not in
-the unit slot. Its size is fixed per platform, because the narrow path
+**Where the context lives.** At the top of the unit's own stack, not in the
+coroutine object. Its size is fixed per platform, because the narrow path
 narrows by having nothing to save rather than by saving a variable
 subset — which is a second reason to prefer the convention over the mask,
-since a variable-size context would make the slot layout in
-`design/pool.md` depend on a compiler's output.
+since a variable-size context would make the layout of the stack's top
+depend on a compiler's output, and `design/stacks.md` sizes a stack without
+consulting one.
 
 **The restore.** Symmetric with the save and driven by the same platform
 constant. It does not have to learn what the save chose, because both
@@ -242,8 +249,8 @@ these.
 | Question | Document |
 |---|---|
 | stack and shadow-stack allocation, pooling and release | `design/stacks.md` |
-| what suspends, parks and migrates | `design/execution.md` |
-| the unit slot, which does not hold the saved context | `design/pool.md` |
+| what suspends, parks and moves between threads | `design/execution.md` |
+| the coroutine object, which does not hold the saved context | `design/execution.md` |
 
 ## Open questions
 

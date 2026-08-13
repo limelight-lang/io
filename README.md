@@ -14,8 +14,8 @@ use it without a runtime of its own.
 
 | Pillar | Idea | Document |
 |---|---|---|
-| Two coroutine kinds | Stackful by default, because only a stackful unit can suspend below a frame someone else compiled. Stackless where we own the compiler and the body never crosses a foreign ABI. Both behind one handle and one wake path | [execution](design/execution.md) |
-| Parking as a protocol | Three states, plain stores, and an order — record, then arm, then suspend — that guarantees a completion finds somewhere to record itself. A unit is touched only by its own thread, so the wake that once arrived mid-suspension cannot | [execution](design/execution.md) |
+| Two coroutine kinds | Stackful by default, because only a stackful unit can suspend below a frame someone else compiled. Stackless where we own the compiler and the body never crosses a foreign ABI. Both behind one counted reference and one wake path | [execution](design/execution.md) |
+| Parking as a protocol | Three states, plain stores, and an order — record, then arm, then suspend — that guarantees a completion finds somewhere to record itself. A unit is touched only by the thread its state word names — for all but a declared actor, the one it has always run on — so the wake that once arrived mid-suspension cannot | [execution](design/execution.md) |
 | Switching by convention | A live-register mask cannot narrow a switch soundly, because callee-saved registers hold ancestors' values. Narrowing is a calling convention with no callee-saved registers along suspendable paths | [switching](design/switching.md) |
 | Stacks reserved, committed lazily | 2 MB of address space costs 4 KB of memory at one page touched, measured. No growth, no segments: the ceiling is kernel mappings, not memory | [stacks](design/stacks.md) |
 | Pools for what the kernel touches | Sockets, timers, buffers and operations live in walkable slabs: enumeration needs no registry, and a buffer pool can be registered with the kernel once. A coroutine is not among them — it is an object of the memory manager, and its lifetime is its reference count | [pool](design/pool.md) |
