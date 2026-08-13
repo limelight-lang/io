@@ -655,6 +655,34 @@ Open:
   reachability proves possibility, not intent. The diagnostic dump over
   the pools is the tool for that case.
 
+## 2026-08-13 — Correction: `ext/async`'s channel timeouts are opt-in now
+
+The entry of 2026-08-12 on deadlock detection says that `php-src/ext/async`
+falls back to five-second timeouts and a bulk close, and gives that as a
+reason. The reason stands; the tense does not. Verified in the working copy at
+`~/php-src/ext/async`: `5000` appears in no `.c` or `.h` file, the generated
+`channel_arginfo.h` shows the constructor's defaults as `0`, `0`, `false`, and
+`docs/channel-deadlock-protection.md` still documents 5000 ms as shipped
+behaviour. The defaults were reverted to zero, which disables both timeout
+layers, so out of the box a channel deadlock there surfaces as a generic
+`DeadlockError` with a wait-graph dump.
+
+The revert's own message is a stronger argument for this substrate than the
+timeout ever was: the 5000 ms defaults "fire false positives in normal pub-sub
+patterns where a producer is a coroutine that calls send() occasionally rather
+than blocking in it", so after five idle seconds the channel closed itself
+while its producers were alive and might have produced later. A wall clock
+cannot tell "no producer exists" from "the producer is idle", and that is a
+category error rather than a tuning problem — which is exactly what
+reachability of the write end answers instead.
+
+What survives from that codebase is the third layer, which never had to be
+reverted: binding a channel to the scope that created it, as observation
+rather than ownership, with a back-pointer so either side may die first.
+
+Recorded as its own entry rather than as an edit, for the reason the
+zero-copy correction of 2026-08-12 gives.
+
 ## 2026-08-13 — An actor may be re-mounted anywhere; the difference is price
 
 Decided by Edmond, and it replaces the conservative rule in
