@@ -43,7 +43,7 @@ Written before the code so that the first module arrives with its checks
 rather than acquiring them later. Nothing here has been run.
 
 **Most of this substrate is single-threaded, and that is what makes it
-testable.** A unit is touched only by its own thread, so the parking
+testable.** A coroutine is touched only by its own thread, so the parking
 protocol, the wake protocol, the wait record and the cancel path are
 ordinary sequential code with an ordering that a test can drive step by
 step. The concurrency is confined to a short list, and only that list

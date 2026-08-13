@@ -3,7 +3,7 @@
 ## What the reactor is
 
 The reactor submits operations to the operating system and delivers their
-completions to the units waiting on them. It is one crate, `io-reactor`,
+completions to the coroutines waiting on them. It is one crate, `io-reactor`,
 depending on `io-core` and never the reverse (`dev/ARCHITECTURE.md`).
 
 ## The API is completion-first
@@ -35,12 +35,12 @@ containerd reject it.
 
 ## One ring per worker
 
-Each worker owns its own submission and completion queues. A unit submits
+Each worker owns its own submission and completion queues. A coroutine submits
 on the worker it is mounted on, and that worker drains its own
 completions.
 
 Anything crossing a worker boundary — a cancel from another thread, an
-operation whose unit migrated — is posted to the owner's intake queue and
+operation whose coroutine migrated — is posted to the owner's intake queue and
 submitted on its next turn; the owner is woken through its wake
 descriptor if it is blocked in the kernel. A single shared ring was the
 alternative and it hangs: without a polling thread, `io_uring_enter`
@@ -118,17 +118,17 @@ A multishot operation is submitted once and completes repeatedly: `accept`
 yielding descriptors, `recv` yielding chunks. Each completion carries
 `IORING_CQE_F_MORE` while more are coming.
 
-**A multishot operation targets a socket, not a unit.** Its completions
+**A multishot operation targets a socket, not a coroutine.** Its completions
 append to a queue owned by the socket slot; they are not validated against
-a unit's epoch, because the unit re-parks between chunks and any
-unit-scoped validation would discard everything after the first. The
+a coroutine's epoch, because the coroutine re-parks between chunks and any
+coroutine-scoped validation would discard everything after the first. The
 queue's entries come from a pool of completion records, with head and tail
 in the socket slot, so a fixed-size slot holds an unbounded series.
 
 **Parking on the queue is an ordinary park with a recheck, and the recheck
 belongs to whoever writes the queue-waiter cell.** Without it a completion
 landing between the drain and the park sees no waiter, appends, and nobody
-ever looks again — the unit sleeps over a full queue.
+ever looks again — the coroutine sleeps over a full queue.
 
 **The cell belongs to the worker whose ring carries the multishot**, which
 is the worker that drains these completions, so one thread writes it, reads
@@ -142,11 +142,11 @@ it and empties it (`design/pool.md`). Two paths follow from that:
   suspends without reading the queue at all, that being another worker's
   memory. The owner writes the cell when it drains the entry, re-reads the
   queue, and on non-empty moves the reference out of the cell into an
-  ordinary `wake`, which dispatch forwards back to the unit's worker.
+  ordinary `wake`, which dispatch forwards back to the coroutine's worker.
 
 The append reads the cell after appending and the publish reads the queue
 after writing the cell, both on the one thread that owns the slot, so
-whichever runs second sees the other's first half. A unit's own remote
+whichever runs second sees the other's first half. A coroutine's own remote
 re-read would order nothing, because it precedes the publish it exists to
 defend. The intake queue carrying the publish is one more consumer of the
 ordering contract the scheduler owes for that queue (`dev/DECISIONS.md`,
@@ -169,7 +169,7 @@ separates a quiet system from one that cannot feed its sockets. The
 detector reports none of this: the liveness row for a wait on the queue
 reads always live, because a pass cannot prove that no buffer ever frees.
 
-**Draining on death.** When a socket closes or its waiting unit ends,
+**Draining on death.** When a socket closes or its waiting coroutine ends,
 every queued entry is drained: provided buffers go back to the ring and
 accepted descriptors are closed. A multishot accept yields descriptors
 rather than buffers, so the two cases need different drains and both are
@@ -228,7 +228,7 @@ successor's (`design/pool.md`).
 The reactor then calls `wake(waiter, entry, epoch, result)` and does not
 touch the wait record itself. Validation and the result store are steps 1
 and 2 of waking (`design/execution.md`); doing them in the reactor would
-open a window between validating and storing in which the unit could win
+open a window between validating and storing in which the coroutine could win
 another entry and re-park, and the result would land in the wrong wait.
 
 A completion whose operation slot is gone releases what it holds and
@@ -295,7 +295,7 @@ and the caller decides.
 
 | Question | Document |
 |---|---|
-| how a unit parks and what `wake` does | `design/execution.md` |
+| how a coroutine parks and what `wake` does | `design/execution.md` |
 | buffers, sockets, operations, and owed completions | `design/pool.md` |
 | cancelling, and what the kernel still owes | `design/cancellation.md` |
 | what a wait on an operation means to the detector | `design/deadlock.md` |

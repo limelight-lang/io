@@ -4,7 +4,7 @@ title Submitting a single-shot operation and delivering its completion\n(design/
 skinparam ArrowColor #444444
 skinparam sequenceMessageAlign left
 
-participant "unit\n(the waiter)" as U
+participant "coroutine\n(the waiter)" as U
 participant "reactor\non worker A" as R
 participant "pool\n(operation slot)" as P
 participant "kernel" as K
@@ -13,7 +13,7 @@ participant "sched\non worker B" as SB
 
 note over R, P
   **This is the single-shot path.** A multishot operation names the
-  socket's handle and never a unit; its completions append to a queue
+  socket's handle and never a coroutine; its completions append to a queue
   in the socket slot, and the waiter lives in that slot's own
   queue-waiter cell. A cancel operation names no waiter at all.
 end note
@@ -23,7 +23,7 @@ end note
 U -> R : submit(operation, buffer)
 R -> P : take a slot
 activate P
-R -> P : write the waiter cell — a counted\nreference to the unit, the entry index,\nthe epoch
+R -> P : write the waiter cell — a counted\nreference to the coroutine, the entry index,\nthe epoch
 note over P
   One writer, one emptier, one thread:
   the worker that owns the ring the
@@ -48,7 +48,7 @@ K -> R : completion
 R -> P : resolve the handle, read the slot
 alt the waiter cell holds a reference
   R -> P : move the reference out of the cell\ninto the wake payload
-  R -> SA : wake(unit, entry, epoch, result)
+  R -> SA : wake(coroutine, entry, epoch, result)
   SA -> SA : **step 0 — dispatch on the state word**
   group four outcomes
     alt the word names this worker

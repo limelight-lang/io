@@ -6,13 +6,13 @@ skinparam ArrowColor #444444
 
 legend left
   |= colour |= whose code the box is (dev/ARCHITECTURE.md) |
-  |<#DDEBF7>  | unit — the record mechanics and the suspension |
+  |<#DDEBF7>  | coroutine — the record mechanics and the suspension |
   |<#E2EFDA>  | the armer of the entry — sync, reactor, the actor call |
   |<#FCE4D6>  | sched — the enqueue |
-  Every step runs on the unit's own thread; the split is by whose code
-  runs, not by which thread. Step 3 is the unit's own suspension, step 4
-  is the worker's, and the stores of step 4 are unit record operations
-  the worker calls. Retirement is a unit operation too, and the handle
+  Every step runs on the coroutine's own thread; the split is by whose code
+  runs, not by which thread. Step 3 is the coroutine's own suspension, step 4
+  is the worker's, and the stores of step 4 are coroutine record operations
+  the worker calls. Retirement is a coroutine operation too, and the handle
   body it invokes belongs to the armer.
 endlegend
 
@@ -33,7 +33,7 @@ end note
 partition "**2. Arm each entry**, one at a time" {
   while (entries left to arm?) is (yes)
     #E2EFDA:submit the operation, send the message
-    or arm the timer — carrying the unit, its
+    or arm the timer — carrying the coroutine, its
     entry index and the epoch of step 1;
     #E2EFDA:install this entry's cancel handle;
     if (satisfied inline?) then (yes)
@@ -57,7 +57,7 @@ stackful: switch to the worker.
 stackless: return Pending from poll;
 
 note right
-  Step 4 is the worker's, not the unit's: a unit
+  Step 4 is the worker's, not the coroutine's: a coroutine
   that announced itself parked while its machine
   context was still being saved would be resumable
   before it was savable.
@@ -81,7 +81,7 @@ else (yes)
   #DDEBF7:retire the entries
   through their cancel handles;
   #DDEBF7:store Woken —
-  this unit is never Parked;
+  this coroutine is never Parked;
   #FCE4D6:enqueue into this worker's list;
   stop
 endif

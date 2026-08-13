@@ -88,7 +88,7 @@ traced as any object's fields are; the constraint is about the ends.
 
 **The waiter queues hold counted, traced references, and two walks skip
 them.** A queue link keeps its waiter alive — `design/execution.md` requires
-whoever arms an entry to hold a counted reference, so that a unit cannot be
+whoever arms an entry to hold a counted reference, so that a coroutine cannot be
 freed under a wake still on its way, and that requirement is what retired the
 generation-and-deferred-reclamation scheme (`dev/DECISIONS.md`, 2026-08-12). A
 counted reference the tracer cannot enumerate would be unsound in this memory
@@ -104,7 +104,7 @@ distorted set of sinks. Both exclusions are stated as one flow rule in
 Three consequences, and each is a rule for the implementation:
 
 - **A node takes its counted reference before its link is published**, and the
-  node carries the unit, the entry index and the epoch.
+  node carries the coroutine, the entry index and the epoch.
 - **A node has one remover at a time**, under the channel's lock. The reference
   is not dropped at the unlink: it *moves* into the inline wake or into the
   intake payload, and is dropped exactly once by whoever consumes that payload.
@@ -311,16 +311,16 @@ three carriers and three discharges:
 2. **A refusal learned on another worker.** The wake was forwarded, so only its
    owner reaches the steps where a refusal is decided; that owner re-runs the
    wake when it drains its intake queue. **The intake payload of a supply wake
-   therefore carries the resource** beside the unit, the entry index, the epoch
+   therefore carries the resource** beside the coroutine, the entry index, the epoch
    and the result. Without it the refusing owner cannot know whose queue to walk:
    on an epoch mismatch the wait record already describes a different wait and
    its resource field belongs to that one.
-3. **A wake accepted and never consumed** — a cancel that found the unit in
+3. **A wake accepted and never consumed** — a cancel that found the coroutine in
    `Woken`, a select arm returning without taking, a wake over a value someone
-   else took. The woken unit discharges the duty itself, on its own thread,
+   else took. The woken coroutine discharges the duty itself, on its own thread,
    inside the substrate's receive, send or select procedure, before the outcome
-   escapes to the caller. A unit torn down without resuming does not exist: a
-   unit always ends itself (`design/execution.md`), so that frame always runs.
+   escapes to the caller. A coroutine torn down without resuming does not exist: a
+   coroutine always ends itself (`design/execution.md`), so that frame always runs.
 
 **Re-running the wake is one procedure everywhere:** take the resource's lock,
 and if the state gives cause — a value present, space free, or closed — and a

@@ -91,7 +91,7 @@ is fine; a reference is not.
 
 **Its queues of waiters are counted and traced, and two walks skip them**, and
 this half is as load-bearing as the first. The link has to be counted, because
-whoever arms an entry holds a reference so that a unit cannot be freed under a
+whoever arms an entry holds a reference so that a coroutine cannot be freed under a
 wake still on its way, and it has to be traced, because a counted reference the
 tracer cannot enumerate is unsound in this memory model. What it must not do is
 conduct L: the flow rule below stops L leaving the cells of a parked coroutine
@@ -176,12 +176,12 @@ One walk propagates two bits that differ in roots and in flow.
 **M, the memory mark.** Unchanged: every root the collector already has,
 including the scheduler's ownership table, the timer wheel and the reactor
 intake queues, flowing through everything. **No pool is a root.** The
-reference in an armed waiter cell names a unit the ownership table still
-registers, because a unit leaves that table only on its terminal transition
+reference in an armed waiter cell names a coroutine the ownership table still
+registers, because a coroutine leaves that table only on its terminal transition
 and reaches it only by resuming, which requires the wait decided; and once
 the wait is decided the only cell emptied across threads is a socket's,
 whose pending retire is an intake entry carrying its own counted reference
-to the unit (`design/pool.md`, `design/reactor.md`).
+to the coroutine (`design/pool.md`, `design/reactor.md`).
 
 **L, the liveness mark.** Roots: globals, the C-ABI registered handle
 table, every coroutine that is neither parked nor `Terminal`, every parked
@@ -200,7 +200,7 @@ L flows through every object except three. It does not flow out of the cells
 of a parked coroutine that is not itself L-marked; it does not flow through
 the waiter-queue links of a supply resource; and it does not flow through
 the fields by which a debtor names its debtor — a mutex's holder, a
-guard-semaphore's holder list, an actor's current unit, a join's target. The
+guard-semaphore's holder list, an actor's current coroutine, a join's target. The
 attribution walk crosses neither of the last two kinds of link. All of them
 are counted references and the memory mark traces them like any other,
 because a counted reference the tracer cannot enumerate is unsound here — an
@@ -257,7 +257,7 @@ An outstanding entry is live when:
 | semaphore, guard-released | the free permits plus the permits held by L-marked holders cover what the waiter asked for. **Dead, and no edge**, for a permit held by a terminated coroutine: teardown drops its guards and returns the permit, so a terminated holder still counted is a leak. One edge per dead holder of a needed permit |
 | semaphore, postable | the free permits cover the request, or the semaphore is served, or the semaphore object is L-marked — over the C ABI, its entry in the registered handle table. Holders are not read: whoever reaches it can post |
 | join | the target is L-marked or terminal, a terminal target's completion wake being in flight |
-| actor call | the callee's current unit is L-marked, or the callee's readiness word reads ready or running, or its mailbox is non-empty. The readiness word is load-bearing rather than a convenience: between the worker taking a message out of the mailbox and creating the unit for it, the other two clauses are both false, and without this one a healthy synchronous call is reported deadlocked (`dev/DECISIONS.md`, 2026-08-13) |
+| actor call | the callee's current coroutine is L-marked, or the callee's readiness word reads ready or running, or its mailbox is non-empty. The readiness word is load-bearing rather than a convenience: between the worker taking a message out of the mailbox and creating the coroutine for it, the other two clauses are both false, and without this one a healthy synchronous call is reported deadlocked (`dev/DECISIONS.md`, 2026-08-13) |
 | channel receive | the buffer is non-empty, or the channel is served, or the channel is closed, or the write end is L-marked |
 | channel send | the buffer has space, or the channel is served by a pending take, or the channel is closed, or the read end is L-marked |
 | future await | it is resolved or broken, or the future is served, or the promise is L-marked |
@@ -343,24 +343,24 @@ Within a sink, in order:
 ### A worked case
 
 ```
-unit 1  AND  [ reply from actor B ]                     parked
-unit 2  OR   [ mutex M, timer 5 s ]                     parked, running B's message
+coroutine 1  AND  [ reply from actor B ]                     parked
+coroutine 2  OR   [ mutex M, timer 5 s ]                     parked, running B's message
 ```
 
-Unit 2 has a live entry, so it is L-marked; unit 1 waits on actor B, whose
-current unit is unit 2, now live, so unit 1 is L-marked too. Nothing is
-reported, and rightly: in five seconds unit 2 resumes with a timeout.
+Coroutine 2 has a live entry, so it is L-marked; coroutine 1 waits on actor B, whose
+current coroutine is coroutine 2, now live, so coroutine 1 is L-marked too. Nothing is
+reported, and rightly: in five seconds coroutine 2 resumes with a timeout.
 
-Remove the timer and neither is seeded. Unit 2 waits on M held by unit 1;
-unit 1 waits on B, whose current unit is unit 2. Both stay unmarked, they
+Remove the timer and neither is seeded. Coroutine 2 waits on M held by coroutine 1;
+coroutine 1 waits on B, whose current coroutine is coroutine 2. Both stay unmarked, they
 form one sink, and one of them is failed.
 
-Chain the starved case onto it. Unit 3 parks receiving on channel D whose
-write end is reachable from nothing; unit 3's frames hold the promise of
-future F; unit 4 awaits F. Both are dead, the graph has one edge, unit 4 to
-unit 3, so unit 3 is the sink and only unit 3 is failed. Unit 3 resumes
+Chain the starved case onto it. Coroutine 3 parks receiving on channel D whose
+write end is reachable from nothing; coroutine 3's frames hold the promise of
+future F; coroutine 4 awaits F. Both are dead, the graph has one edge, coroutine 4 to
+coroutine 3, so coroutine 3 is the sink and only coroutine 3 is failed. Coroutine 3 resumes
 with the closed-channel error, and when its frames drop the promise, F
-breaks and unit 4 fails with it — in the wake of the same pass.
+breaks and coroutine 4 fails with it — in the wake of the same pass.
 
 ## Reading a moving system
 
@@ -568,7 +568,7 @@ deadlock, and the walk alone for a total freeze.
   (`design/pool.md`). Whether the barrier discipline that covers any root
   mutation covers this one is the same unverified question, and if
   `ll-model` requires every counted in-edge enumerated per object, the
-  cell's reference is enumerated at the unit's own record — one in-edge per
+  cell's reference is enumerated at the coroutine's own record — one in-edge per
   outstanding entry naming a pooled resource.
 - **The intake queue's ordering contract is owed by the scheduler**
   (`dev/DECISIONS.md`, 2026-08-13), and no document describes the queue's

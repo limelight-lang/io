@@ -2,44 +2,44 @@
 
 ## What cancellation is
 
-Cancellation ends a wait early. It does not kill a unit and it does not
+Cancellation ends a wait early. It does not kill a coroutine and it does not
 take memory away from the kernel. Those two mistakes are what the design
 is arranged against.
 
-**A unit always unwinds itself.** A cancel makes its current wait finish
-with a cancelled result; the unit resumes, observes it, and unwinds from
-its own suspension point. Nothing unwinds a unit from another thread,
+**A coroutine always unwinds itself.** A cancel makes its current wait finish
+with a cancelled result; the coroutine resumes, observes it, and unwinds from
+its own suspension point. Nothing unwinds a coroutine from another thread,
 because the frames below the suspension point may be foreign and their
 cleanup is not ours to run (`design/execution.md`).
 
-## Cancelling a unit is a wake
+## Cancelling a coroutine is a wake
 
 A cancel is delivered through the state word, not through an entry. This is
 the whole of the fix for two failures the first version of this document
-had: a cancelled unit parked on an AND wait never resumed, because the
+had: a cancelled coroutine parked on an AND wait never resumed, because the
 ordinary wake path decrements `remaining` and returns without waking
 until it reaches zero; and a cancel racing with a park was lost, because
-it validated an epoch the unit was in the middle of replacing.
+it validated an epoch the coroutine was in the middle of replacing.
 
-**The state word carries a cancelled bit, written by the unit's own
+**The state word carries a cancelled bit, written by the coroutine's own
 thread.** A cancel raised on another thread is posted to the owning
 worker's intake queue and applied when that worker drains it, so the bit is
 a plain store on the same word the parking protocol writes
-(`design/execution.md`). The row for a *freed* unit is gone with the
+(`design/execution.md`). The row for a *freed* coroutine is gone with the
 generation it used to check: whoever raises a cancel holds a counted
-reference, so the unit cannot be gone. Finished it can be, and `Terminal`
+reference, so the coroutine cannot be gone. Finished it can be, and `Terminal`
 is what says so.
 
 | State found | What the canceller does | Effect |
 |---|---|---|
-| `Running` | set the bit | the unit's next park attempt does not sleep and it resumes cancelled |
+| `Running` | set the bit | the coroutine's next park attempt does not sleep and it resumes cancelled |
 | `Parked` | store the error in the record's own result slot, claim the winner with the no-entry value, retire the entries, store `Woken`, enqueue | the ordinary wake path with the cancel as its winner |
-| `Woken` | set the bit | the unit is already owed a slot; it resumes cancelled |
-| `Terminal` | nothing | the unit completed already; the request answers *already finished* |
-| `WokenShared`, a declared actor only | write the cancelled byte, re-read the word, answer from the re-read | no worker owns the unit; the one that wins the mount inherits the bit and the next park fails on it |
+| `Woken` | set the bit | the coroutine is already owed a slot; it resumes cancelled |
+| `Terminal` | nothing | the coroutine completed already; the request answers *already finished* |
+| `WokenShared`, a declared actor only | write the cancelled byte, re-read the word, answer from the re-read | no worker owns the coroutine; the one that wins the mount inherits the bit and the next park fails on it |
 
 **Claiming the wait is what makes every other waker harmless**, and the
-epoch is not touched: it is written once, when the unit parks
+epoch is not touched: it is written once, when the coroutine parks
 (`dev/DECISIONS.md`, 2026-08-13). What is claimed is the winner field,
 which the record carries under AND as well as under OR for exactly this
 case, and it is claimed with a reserved value no entry index takes, the
@@ -53,7 +53,7 @@ so cancel handles are called exactly once and need not be idempotent.
 
 **The parking protocol reads the bit at one place**: step 4, where the
 worker stores `Parked`. With the bit set it stores `Woken` and enqueues
-instead, so a unit cancelled while it was suspending does not sleep. No
+instead, so a coroutine cancelled while it was suspending does not sleep. No
 ordering is needed beyond the sequence the protocol already has, because
 both the cancel and the park run on this one thread — a cancel drained
 before the park sees `Running`, and one drained after it sees `Parked`.
@@ -65,13 +65,13 @@ a consumer cancelling work of its own:
 
 | Answer | Meaning |
 |---|---|
-| delivered | the unit will resume cancelled |
-| already finished | the state word was `Terminal`: the unit completed before the cancel was applied |
-| pinned | the unit is below a live foreign frame; the bit is set, and it takes effect only if the frame returns |
-| not deliverable | the unit is parked below a foreign frame that cannot return; nothing more will happen |
+| delivered | the coroutine will resume cancelled |
+| already finished | the state word was `Terminal`: the coroutine completed before the cancel was applied |
+| pinned | the coroutine is below a live foreign frame; the bit is set, and it takes effect only if the frame returns |
+| not deliverable | the coroutine is parked below a foreign frame that cannot return; nothing more will happen |
 
 Without these a requester cancels, learns nothing, and repeats itself
-against a unit that will never answer. **The detector is not one of those
+against a coroutine that will never answer. **The detector is not one of those
 requesters**: it reads the foreign-frame count while it walks and never
 chooses a coroutine whose failure has nowhere to surface, and what it sends
 is a conditional resolution into the owner's intake queue rather than a request
@@ -101,7 +101,7 @@ value's row.
 ### Two levels, and what the bit means afterwards
 
 **Cooperative** cancellation clears the bit when the cancelled result is
-delivered. The unit may park again while unwinding, which it must: closing
+delivered. The coroutine may park again while unwinding, which it must: closing
 a TLS session, releasing a remote lock, and flushing a log are all I/O
 that happens during cleanup.
 
@@ -112,7 +112,7 @@ Shutdown and an unresponsive victim use this level; ordinary cancellation
 does not.
 
 A consumer that swallows a cooperative cancellation has un-cancelled its
-unit, which is deliberate — a `catch` block in PHP that handles the
+coroutine, which is deliberate — a `catch` block in PHP that handles the
 cancellation exception is entitled to continue. A supervisor that means
 otherwise escalates to final.
 
@@ -136,8 +136,8 @@ on what armed it:
 
 **Retirement is asynchronous and a retired entry may still fire.** Two
 tests make that harmless and they answer different questions
-(`design/execution.md`). A signal from a wait the unit has already left
-carries a stale epoch, because the epoch is written once, when the unit
+(`design/execution.md`). A signal from a wait the coroutine has already left
+carries a stale epoch, because the epoch is written once, when the coroutine
 parks again. A signal from the current wait, already decided, is rejected
 by the decidedness test — the winner field claimed, or `remaining` at
 zero — which is one test in both modes, since a cancel claims the winner
@@ -152,18 +152,18 @@ Cancelling asks the kernel to finish sooner; it does not withdraw the
 submission and it does not return the buffer.
 
 0. **Empty the waiter cell.** Retiring the entry takes the counted
-   reference to the unit out of the cell of whichever slot the entry
+   reference to the coroutine out of the cell of whichever slot the entry
    names — the operation's for a single-shot wait, the socket's for a wait
    on a multishot stream, whose operation slot holds no cell of its own —
    (`design/pool.md`). It runs on the worker that owns that slot: inline
    when the wait ended there, and through that worker's intake queue
-   otherwise. **The reference is dropped on the unit's own thread and
+   otherwise. **The reference is dropped on the coroutine's own thread and
    nowhere else.** Inline, that is the same thread. Across threads, the
-   request carries a counted reference the poster took on the unit's
+   request carries a counted reference the poster took on the coroutine's
    thread, the applier moves the cell's reference into the confirmation it
    posts back, and both are dropped when that confirmation is drained, so
    no foreign worker touches a non-atomic count. From here the operation
-   names no unit, and a completion it still owes wakes nobody. **A retire
+   names no coroutine, and a completion it still owes wakes nobody. **A retire
    that finds the result already received stops here** and submits no
    cancel: a completion that has arrived cannot be hastened.
 1. **Request.** Submit a cancel naming the operation by its handle. On
@@ -250,10 +250,10 @@ against a hung mount stays outstanding as long as the mount does.
 
 - **The resources are accounted, not leaked.** The operation slot stays
   live and its buffer stays pinned, both visible in the pools, so a walk
-  names them (`design/pool.md`). Neither is the unit: its waiter cell was
+  names them (`design/pool.md`). Neither is the coroutine: its waiter cell was
   emptied in phase 0, so what a stuck operation holds is a slot and a
   buffer and nothing else.
-- **The unit does not wait for them.** It resumed on the cancelled result
+- **The coroutine does not wait for them.** It resumed on the cancelled result
   the moment the state word moved, and it may complete and be freed when
   its own last reference goes; its destructors run on that path and not on
   the kernel's.
@@ -275,7 +275,7 @@ waiting either.** Tearing down an io_uring ring waits for its in-flight
 requests, and Windows process teardown waits for drivers to complete
 cancelled IRPs. An operation stuck in an uninterruptible stage therefore
 delays exit no matter what this design does. The honest statement is that
-shutdown waits for units and abandons operations, and that the kernel may
+shutdown waits for coroutines and abandons operations, and that the kernel may
 still hold the process in teardown afterwards.
 
 ## Decided elsewhere
@@ -299,7 +299,7 @@ still hold the process in teardown afterwards.
   (`design/reactor.md`).
 - **`IORING_REGISTER_SYNC_CANCEL`'s kernel floor**, which matters on
   Android and on older long-term kernels, is not established here.
-- **A created-but-unmounted unit** is in none of the states above and has
+- **A created-but-unmounted coroutine** is in none of the states above and has
   no wait record, so the cancelled bit is all a cancel can set. It is
   mounted, resumes, and unwinds immediately, which wastes a mount and has
   not been compared against finding it in the queue it was created into —

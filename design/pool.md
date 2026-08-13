@@ -136,7 +136,7 @@ detector can report: a write end held by live code that never writes
 liveness over the collector's object graph — so the rules below serve the
 dump alone.
 
-**The collector reads nothing in a pool either.** An armed cell's unit is
+**The collector reads nothing in a pool either.** An armed cell's coroutine is
 reachable through the scheduler's ownership table while its wait is
 undecided, and through the intake entry of a pending cross-thread retire
 afterwards; both are roots the collector already has, so no scan of slabs
@@ -174,14 +174,14 @@ two inline entries sit in the object, further entries spill into one raw
 block freed through `deferred_free`, and the scheduler holds one counted
 reference for as long as it owns the coroutine (`dev/DECISIONS.md`,
 2026-08-12). An actor's header sits in the arena the actor owns, so that it
-travels with the memory it describes: the state word, the mailbox, the unit
+travels with the memory it describes: the state word, the mailbox, the coroutine
 mounted for the message in flight, and the intrusive link by which the
 scheduler queues it (`dev/DECISIONS.md`, 2026-08-13). The saved machine
 context is in neither place — it sits at the top of the coroutine's own
 stack (`design/switching.md`), which is a pooled object in its own right.
 
 What the detector asks about an actor is therefore read from that header
-rather than from a slot: whether a unit is mounted, whether one is queued,
+rather than from a slot: whether a coroutine is mounted, whether one is queued,
 and whether the mailbox is empty (`design/deadlock.md`). An actor that is
 idle with an empty mailbox is answered by the liveness table of that
 document and not here.
@@ -191,12 +191,12 @@ document and not here.
 | Group | Contents |
 |---|---|
 | header | `state`: submitted, result received, awaiting notification, cancelling |
-| waiter cell | a counted reference to the waiting unit, the entry index, the epoch to validate — or empty |
+| waiter cell | a counted reference to the waiting coroutine, the entry index, the epoch to validate — or empty |
 | memory | the buffer handle it pins, and the buffer's registered index if it has one |
 | accounting | how many completions the kernel still owes |
 
 **The waiter cell has one writer, one emptier and one thread**, and that
-thread is the slot's owner. For an operation and a timer it is the unit's
+thread is the slot's owner. For an operation and a timer it is the coroutine's
 own thread, because arming submits to this worker's own ring and wheel
 (`dev/DECISIONS.md`, 2026-08-13), so the cell is written at step 2 of the
 parking protocol. The same worker empties it, at whichever of two events
@@ -207,7 +207,7 @@ reference moves (`design/channels.md`). Retiring the entry empties the cell befo
 kernel cancel is submitted. Applied inline when the wait ended on this
 worker, it drops the reference there and then. **A cross-thread retire drops
 nothing where it runs**: the request carries a counted reference of its own,
-taken by the poster on the unit's thread, and the applier moves the cell's
+taken by the poster on the coroutine's thread, and the applier moves the cell's
 reference into the confirmation it posts back, so both come home to be
 dropped where the count belongs. No thread ever decrements a count it does
 not own, which is the shape the completion path already has. A retire that
@@ -215,7 +215,7 @@ finds the result already received submits no kernel cancel, there being
 nothing left to hasten.
 
 Two slots hold no waiter cell of their own. **A multishot operation names
-the socket's handle and never a unit**, because the unit re-parks between
+the socket's handle and never a coroutine**, because the coroutine re-parks between
 chunks (`design/reactor.md`); the reference for a wait on that queue sits
 in the socket slot's queue-waiter cell, which is a cell of this kind. **A
 cancel operation** names the operation it cancels and no waiter at all.
@@ -234,7 +234,7 @@ kernel does not always owe exactly one:
 The slot is released, and its buffer unpinned, when the owed count reaches
 zero and not before. **A completion arriving at an empty waiter cell calls
 no `wake`**: it adjusts the owed count, applies its buffer rule, and
-releases the slot if the count reached zero. Slot release involves no unit,
+releases the slot if the count reached zero. Slot release involves no coroutine,
 which is what keeps an operation abandoned against a hung mount from
 outliving anything but its buffer and its slot (`design/cancellation.md`).
 
@@ -247,7 +247,7 @@ to (`design/reactor.md`, `design/deadlock.md`). None holds an owner field,
 because none of those waits is ended by a coroutine, and the `kind` byte of
 the slot is what the detector reads to pick the rule.
 
-Every other resource a unit can wait on is an entity of the memory manager
+Every other resource a coroutine can wait on is an entity of the memory manager
 or of the thread's heap, and its kind is read from its class rather than
 from a slot header. A mutex, a join, a synchronous actor call and a
 semaphore whose permits are released only by dropping a guard name one
@@ -263,17 +263,17 @@ decided here.
 A buffer slot is a header, a length, the registered index if the pool is
 registered, and the payload. A socket slot is a header, the descriptor or
 its registered index, and the head and tail of the queue a multishot
-operation appends to, plus the queue-waiter cell a unit parking on that
+operation appends to, plus the queue-waiter cell a coroutine parking on that
 queue writes (`design/reactor.md`). A timer slot is a header, a deadline
 and a waiter cell. All three cells obey the same invariant, and it is *one
-thread* rather than *the waiting unit's thread*: the cell belongs to the
+thread* rather than *the waiting coroutine's thread*: the cell belongs to the
 worker that owns the slot, which for an operation and a timer is the
 worker that submitted or armed it, and for a socket's queue-waiter cell is
-the worker whose ring carries the multishot. A unit parked from any other
+the worker whose ring carries the multishot. A coroutine parked from any other
 worker reaches the cell through that worker's intake queue, and the
 park-time recheck of the queue is performed by whichever thread writes the
 cell, immediately after the write (`design/reactor.md`). None of these slots carries a wait
-record: only units wait.
+record: only coroutines wait.
 
 ## Allocation and release
 
@@ -288,7 +288,7 @@ to a shared free list in batches.
 - **Release:** store `free` into the state word, then publish the slot to
   the retire list of the current epoch. It becomes takeable only after
   every worker has passed a quiescent point.
-- **Batch return** keeps a worker finishing many units off the shared
+- **Batch return** keeps a worker finishing many coroutines off the shared
   list.
 
 ## Registered buffers and their limits

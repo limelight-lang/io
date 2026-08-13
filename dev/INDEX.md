@@ -30,13 +30,23 @@ wait record per thing a coroutine waits on. Every design document uses the
 new word; `DECISIONS.md` entries written before that date keep the old one,
 because a superseded entry is never edited.
 
+**`unit` is `coroutine`** (2026-08-13, Edmond's ruling): one resumable flow
+of control, whether it stands alone or carries one message of an actor. The
+old word named nothing on its own and collided with "execution unit", a
+stage of a processor pipeline; the corpus had also drifted into using both
+words for the same object, `deadlock.md` and `channels.md` against everyone
+else. Renamed in every `design/` document, in `README.md`, and in the `dev/`
+map, workflow and diagrams. `DECISIONS.md` and `POSTMORTEM.md` keep the old
+word, being records of what was said when. `corosensei`'s own `Coroutine`
+type is a foreign name and was never ours.
+
 ## Design documents
 
 Written in the order below; each is listed here once it exists.
 
 | Document | Answers |
 |---|---|
-| `design/execution.md` | what an execution unit is, how the two coroutine kinds share one reference and one wake path, how a unit is mounted on a thread |
+| `design/execution.md` | what a coroutine is, how the two kinds share one reference and one wake path, how a coroutine is mounted on a thread |
 | `design/switching.md` | narrow and full context switches, the live-register mask, the foreign-frame bit |
 | `design/stacks.md` | reservation, lazy commit, pooling, size classes, the mapping ceiling |
 | `design/pool.md` | slot layout for sockets, timers, operations and buffers; how the pools are walked; what is not a pool slot and where it lives instead |
@@ -71,5 +81,5 @@ Written in the order below; each is listed here once it exists.
   a timeout, the removal at retirement — and it is one of the three memory
   roots, but `design/reactor.md` does not describe it.
 - The C-ABI surface: the registered handle table with its register and
-  unregister calls, the death notification for a unit ended by a stack
+  unregister calls, the death notification for a coroutine ended by a stack
   overflow, and how a foreign holder dropping a write end becomes visible.

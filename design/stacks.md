@@ -2,9 +2,9 @@
 
 ## What a stack costs
 
-A stackful unit's stack is a reservation of address space plus the pages
+A stackful coroutine's stack is a reservation of address space plus the pages
 it actually touches. The reservation is large and cheap; the touched
-pages are what the process pays for. Stackless units have no stack of
+pages are what the process pays for. Stackless coroutines have no stack of
 their own (`design/execution.md`).
 
 Measured on this project's Linux machine — 6.6 under WSL2, 4 KB pages,
@@ -63,25 +63,25 @@ It works and it buys nothing over the ordinary mapping on Linux.
 
 **An I/O buffer, an `iovec` array, a `msghdr`, and every other structure
 the kernel may read or write after submission come from the buffer pool,
-never from a unit's stack.** This is a rule of the substrate, enforced by
+never from a coroutine's stack.** This is a rule of the substrate, enforced by
 the only API that submits operations (`design/reactor.md`).
 
 The rule exists because completion-based I/O separates "the call
 returned" from "the kernel is done". A read whose buffer is a local
-variable stays live until its completion arrives, and cancelling the unit
+variable stays live until its completion arrives, and cancelling the coroutine
 does not cancel that. Without the rule, three failures follow and none of
 them is detectable:
 
-- the unit dies, its stack is pooled, and the late completion writes into
-  the next unit's frames;
-- the unit does not die but returns past the awaiting frame, and the late
+- the coroutine dies, its stack is pooled, and the late completion writes into
+  the next coroutine's frames;
+- the coroutine does not die but returns past the awaiting frame, and the late
   completion writes into its own live frames — the same corruption
   without any reuse;
 - the retired loser of an `await` with a timeout completes after the
   winner resumed, which is the common case rather than the exotic one
   (`design/execution.md`).
 
-With the rule, a stack's lifetime is exactly its unit's, and this
+With the rule, a stack's lifetime is exactly its coroutine's, and this
 document needs no protocol for a stack that outlives its owner. That is
 the whole reason the rule is stated here rather than only in the reactor:
 it is what makes stack management simple, and giving it up would put a
@@ -102,15 +102,15 @@ Two ways past it, and they are not equivalent:
 - **Raise `vm.max_map_count`.** One line of deployment configuration,
   unavailable where we do not control the host.
 - **Carve stacks from slabs.** One mapping holds many stacks, so the
-  count stops scaling with the unit count. What is given up is the guard
+  count stops scaling with the coroutine count. What is given up is the guard
   page, and with it the ability to catch an overflow at the instruction
   that caused it.
 
 The default is one mapping and one guard page per stack. A consumer above
-thirty thousand simultaneous stackful units chooses slabs explicitly, and
-**slabs are refused for any unit that enters foreign code**: a large
+thirty thousand simultaneous stackful coroutines chooses slabs explicitly, and
+**slabs are refused for any coroutine that enters foreign code**: a large
 foreign frame that steps over a red zone corrupts the *neighbouring*
-unit's stack while leaving its own red zone intact, so the check on
+coroutine's stack while leaving its own red zone intact, so the check on
 return to the scheduler passes and reports nothing.
 
 ## Guard bands must match the probe interval
@@ -137,7 +137,7 @@ assume:
 - rustc's probe support is per target, and whether it covers 32-bit ARM
   is **not verified**. The substrate's own code is what would go
   unprobed.
-- The frames of libraries below our units — OpenSSL, libxml, a PHP
+- The frames of libraries below our coroutines — OpenSSL, libxml, a PHP
   extension — are probed by nobody's declaration. Widening the band is
   the only defence that reaches them, which is why the band is sized by
   platform rather than declared per consumer.
@@ -145,9 +145,9 @@ assume:
 ## Size classes
 
 Stacks come in a small fixed set of sizes, because touched depth varies
-by orders of magnitude between a unit awaiting a socket and a unit
+by orders of magnitude between a coroutine awaiting a socket and a coroutine
 running a recursive parser. A class is chosen at creation from a hint the
-consumer supplies, and the unit keeps that stack for its life: there is
+consumer supplies, and the coroutine keeps that stack for its life: there is
 no growth, by decision (`dev/DECISIONS.md`, 2026-08-12).
 
 The hint crosses the C ABI as a size in bytes, rounded up to the nearest
@@ -161,7 +161,7 @@ multiple of the page size, each with its own free list.
 
 ## Pooling and release
 
-A stack returns to the free list of its class when its unit completes.
+A stack returns to the free list of its class when its coroutine completes.
 Because nothing the kernel touches lives on a stack, completion is the
 only condition: there is no confirmation to wait for.
 
@@ -172,7 +172,7 @@ it before the drop discards those very pages, and the second worker then
 reads zeros out of memory it just wrote.
 
 **Release is not per completion.** Dropping pages costs a syscall and a
-TLB shootdown, and `design/execution.md` fixes one unit per message, so
+TLB shootdown, and `design/execution.md` fixes one coroutine per message, so
 releasing on every completion would put both on the per-message path.
 Stacks return to the free list with their pages intact, and pages are
 dropped only from stacks above a per-class warm watermark, in batches.
@@ -199,7 +199,7 @@ matters more on Windows than elsewhere.
 
 Overflow faults on the guard page. **The default outcome is that the
 process ends**, and this document states that rather than the earlier
-promise of unwinding the unit, because unwinding from a fault is not
+promise of unwinding the coroutine, because unwinding from a fault is not
 generally available:
 
 - the handler needs `sigaltstack`, since the stack pointer is in the
@@ -225,16 +225,16 @@ mechanism is different in kind — `STATUS_STACK_OVERFLOW` through
 structured exception handling, with `_resetstkoflw` to re-arm the guard —
 and is a separate implementation rather than a port.
 
-A unit with a live foreign frame is never unwound, on any platform
+A coroutine with a live foreign frame is never unwound, on any platform
 (`design/execution.md`).
 
-The consumer is told which unit died and how deep it was through the
-death-notification path of `io-api`, which no document owns yet: a unit
+The consumer is told which coroutine died and how deep it was through the
+death-notification path of `io-api`, which no document owns yet: a coroutine
 that dies unwaited-for has no waker to carry a result.
 
 ## Shadow stacks
 
-Where hardware shadow stacks are enforced, each stackful unit needs one,
+Where hardware shadow stacks are enforced, each stackful coroutine needs one,
 allocated with it and switched with it (`design/switching.md`). Almost
 nothing above transfers to them, and the section exists to say so.
 
@@ -250,7 +250,7 @@ nothing above transfers to them, and the section exists to say so.
 - **Sizing is by depth**, since a shadow stack holds one return address
   per frame, so it needs a class table of its own that does not follow
   the ordinary one.
-- **The ceiling halves.** A unit costs two reservations, and with guard
+- **The ceiling halves.** A coroutine costs two reservations, and with guard
   pages four mappings, so the 32 754 measured above becomes roughly half
   that where CET is on. Whether a guard page can be `mprotect`ed into a
   shadow-stack mapping at all is **not verified**.
@@ -260,12 +260,12 @@ the Windows and CET backends must resolve.
 
 ## The worker stack
 
-Worker threads run on ordinary thread stacks, and stackless units consume
+Worker threads run on ordinary thread stacks, and stackless coroutines consume
 them (`design/execution.md`). Their size is the platform default unless
-the consumer overrides it at startup, and overflow there is not a unit's
+the consumer overrides it at startup, and overflow there is not a coroutine's
 overflow: the frames on it belong to the scheduler, so the process ends
-with no attempt at recovery. A consumer whose stackless units nest deeply
-raises the worker stack size rather than relying on a per-unit mechanism
+with no attempt at recovery. A consumer whose stackless coroutines nest deeply
+raises the worker stack size rather than relying on a per-coroutine mechanism
 that does not apply.
 
 ## What is taken
@@ -280,7 +280,7 @@ pooling is the reason this document exists.
 | Question | Document |
 |---|---|
 | what a switch saves, the TEB swap, the shadow-stack swap | `design/switching.md` |
-| which units have stacks, and why a unit always ends itself | `design/execution.md` |
+| which coroutines have stacks, and why a coroutine always ends itself | `design/execution.md` |
 | the buffer pool that holds everything the kernel touches | `design/reactor.md` |
 | the coroutine object that points at a stack | `design/execution.md` |
 
@@ -294,9 +294,9 @@ pooling is the reason this document exists.
 - **Shadow stacks entirely.** Allocation on Windows, pooling on Linux,
   guard pages, and the depth-driven class table.
 - **32-bit Android.** A 2 MB class against a two- to three-gigabyte user
-  address space caps a process near a thousand stackful units, and the
+  address space caps a process near a thousand stackful coroutines, and the
   only lever is smaller classes: actors are stackful by decision and
-  C-ABI consumers get stackful units only, so there is no escape into the
+  C-ABI consumers get stackful coroutines only, so there is no escape into the
   stackless kind for the consumers that exist there.
 - **Probe coverage.** Whether rustc probes on every target we ship, and
   what the substrate does on a target where it does not.

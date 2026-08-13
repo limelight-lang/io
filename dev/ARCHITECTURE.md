@@ -18,7 +18,7 @@ mutexes, joins and semaphores, which is why those live in the core crate.
 
 | Crate | Holds | Depends on |
 |---|---|---|
-| `io-core` | `unit`, `switch`, `stack`, `sched`, `pool`, `sync`, `deadlock`, the unit half of `cancel` | memory manager |
+| `io-core` | `coroutine`, `switch`, `stack`, `sched`, `pool`, `sync`, `deadlock`, the coroutine half of `cancel` | memory manager |
 | `io-reactor` | `reactor` and the four backends, each behind a cargo feature; the operation half of `cancel`; the worker driver's implementation | `io-core` |
 | `io-api` | the public surface and the C ABI | `io-core`, `io-reactor` |
 
@@ -44,15 +44,15 @@ the boundary invokes it without looking behind it.**
   hook, and `sched`'s drain invokes it.
 
 **The intake queue does not cross the line.** It is `sched`'s, whole, in
-`io-core`: one queue per worker, and **every signal addressed to a unit
+`io-core`: one queue per worker, and **every signal addressed to a coroutine
 that starts on another thread travels through it**. Three crossings do
 not: an enqueue into the ready set, a push into an actor's mailbox, and
 the cancelled byte of a declared actor. Each addresses an actor rather
-than a unit, and each carries an ordering rule of its own.
+than a coroutine, and each carries an ordering rule of its own.
 
 An entry is a **declaration** and an **applier**. The declaration is what
 any reader may see without knowing the poster — the counted cells the
-entry holds, which make the queue a memory root; the unit and epoch it
+entry holds, which make the queue a memory root; the coroutine and epoch it
 names, or none, which seed the liveness mark; the resource it would move,
 or none, which feeds the served set. That last field is a word `sched`
 carries and never interprets: the detector resolves it against the
@@ -68,17 +68,17 @@ Ten rows, nine modules and the API crate, each with the same six lines.
 Files are proposed, not written; naming them here is what this stage is
 for.
 
-### `unit` — one resumable flow of control
+### `coroutine` — one resumable flow of control
 
-- **Files:** `unit/mod.rs`, `unit/record.rs`, `unit/state.rs`,
-  `unit/stackful.rs`, `unit/stackless.rs`
-- **Public:** `Unit`, `UnitRef`, `State`, `WaitRecord`, `Entry`,
+- **Files:** `coroutine/mod.rs`, `coroutine/record.rs`, `coroutine/state.rs`,
+  `coroutine/stackful.rs`, `coroutine/stackless.rs`
+- **Public:** `Coroutine`, `CoroutineRef`, `State`, `WaitRecord`, `Entry`,
   `EntryIndex`, `Epoch`, `WaitMode`, `CancelHandle` — which it defines and
   every armer installs into — and the record operations: write the record,
   test the epoch, apply a result, test decidedness, claim the winner,
   retire the entries, store the state word
 - **Crosses its boundary:** a counted reference, which is the only name a
-  unit has; the record operations, which `sched` composes into the
+  coroutine has; the record operations, which `sched` composes into the
   callable `park` and `wake`; the `walk` hook by which the memory manager
   reaches its cells — the two inline entries and the spill block — which is
   what the detector rides; the joiner list it wakes at teardown, after
@@ -92,7 +92,7 @@ for.
 - **Does not know:** which backend completed an operation, what a socket
   is, what a channel is, which worker owns it — the owner half of its own
   wider word is a tag it stores and never resolves
-- **Depends on:** `stack`, `switch`, memory manager — a unit is an ordinary
+- **Depends on:** `stack`, `switch`, memory manager — a coroutine is an ordinary
   entity of it, with a class the runtime builds and a spill block freed
   through deferred release
 
@@ -122,10 +122,10 @@ for.
   `stack/overflow.rs`
 - **Public:** `Stack`, `StackPool`, `SizeClass`, `ShadowStack`, `take`,
   `release`
-- **Crosses its boundary:** a stack lent to a unit for its lifetime; the
+- **Crosses its boundary:** a stack lent to a coroutine for its lifetime; the
   region at its top that `switch` lays out; the size hint a consumer may
-  pass over the C ABI; the fact that a unit may enter foreign code, which
-  is the one property of a unit this module reads, because such a unit is
+  pass over the C ABI; the fact that a coroutine may enter foreign code, which
+  is the one property of a coroutine this module reads, because such a coroutine is
   refused a slab-carved stack and gets its own mapping with a guard page
 - **Knows:** reservation and lazy commit per platform, size classes and
   the warm watermark, guard bands, the mapping ceiling and the two ways
@@ -138,7 +138,7 @@ for.
   foreign code
 - **Depends on:** memory manager
 
-### `sched` — mounting units on threads
+### `sched` — mounting coroutines on threads
 
 One module and three parts, because the predicate that decides a worker
 has nothing to do reads all five places at once and is written once.
@@ -148,7 +148,7 @@ with the consumer's actor context, the quiescent-point counter it
 publishes for `pool`, the drain of the intake queue, and the driver it
 defines for `io-reactor` to implement.
 
-**Two private lists per worker** — pinned ordinary coroutines, and units
+**Two private lists per worker** — pinned ordinary coroutines, and coroutines
 woken mid-message. Single-owner and without atomics, because an ordinary
 coroutine's reference counts are non-atomic and it is pinned for life, so
 **no other worker may read them**.
@@ -166,7 +166,7 @@ these two parts cannot share a paragraph.
   `IntakeEntry`, `WorkerDriver`, `WorkerWaker`, `MountHook`,
   `UnmountHook`, `park`, `wake`, `enqueue`, `spawn`
 - **Crosses its boundary:** the ownership table, a memory root and a
-  registry of lifetimes, which is what reaches a unit whose wait is still
+  registry of lifetimes, which is what reaches a coroutine whose wait is still
   undecided (`design/deadlock.md`); the
   intake queue, the other root and the one path a payload takes across
   threads; the actor's readiness word, which the detector reads; the
@@ -179,10 +179,10 @@ these two parts cannot share a paragraph.
   is rung through the driver's waker; that a park may have to arm a
   watchdog and a last-to-sleep worker to request a pass, both of which it
   performs through predicates the detector installs
-- **Does not know:** how a unit suspends internally, how an operation
+- **Does not know:** how a coroutine suspends internally, how an operation
   completes, what a channel is, which waits are worth a watchdog, what is
   behind an applier, a duty hook, a driver or an arming predicate
-- **Depends on:** `unit`, `switch`
+- **Depends on:** `coroutine`, `switch`
 
 ### `pool` — slabs, slots and the waiter cell
 
@@ -205,7 +205,7 @@ these two parts cannot share a paragraph.
   slots, and never follows a waiter cell
 - **Does not know:** the layout of a coroutine or an actor — neither is a
   slot; what a wait edge means; the reactor backend
-- **Depends on:** memory manager, `unit` (a waiter cell holds a counted
+- **Depends on:** memory manager, `coroutine` (a waiter cell holds a counted
   reference and an entry index), `sched` (the quiescent point)
 
 ### `sync` — channels, futures, and the primitives a wait can name
@@ -230,11 +230,11 @@ these two parts cannot share a paragraph.
   an end; closing and breaking; decide-and-publish under a leaf lock; the
   duty a supply wake carries and who re-runs it; whether a waiter is on
   this thread, which decides an inline wake against a forwarded one
-- **Does not know:** how a unit suspends; how liveness is computed — the
+- **Does not know:** how a coroutine suspends; how liveness is computed — the
   marks that do and do not cross the owner field are `deadlock`'s; what any
   other poster puts in an intake entry, its own carrying the resource
-  beside the unit, the entry index, the epoch and the result
-- **Depends on:** `unit`, `sched`, memory manager — a local channel lives
+  beside the coroutine, the entry index, the epoch and the result
+- **Depends on:** `coroutine`, `sched`, memory manager — a local channel lives
   in the thread's heap and a shared one in the immortal region, and the
   detector reads their kind from the class
 
@@ -266,7 +266,7 @@ these two parts cannot share a paragraph.
 - **Does not know:** how an operation is submitted, how a stack is
   allocated, how a channel is implemented — it reads the observables
   `sync` exposes and nothing behind them
-- **Depends on:** memory manager, `unit`, `sync`, `sched`, `pool` (a
+- **Depends on:** memory manager, `coroutine`, `sync`, `sched`, `pool` (a
   slot's `kind` byte, and the dump), `switch` (the foreign-frame count)
 
 ### `reactor` — submitting operations and delivering completions
@@ -288,7 +288,7 @@ these two parts cannot share a paragraph.
   the timer wheel; the thread pool that carries regular-file I/O on the
   readiness backends; which thread owns which ring
 - **Does not know:** scheduling policy, liveness, what a channel is
-- **Depends on:** `pool`, `sched`, `unit`, `deadlock` (the diagnostic
+- **Depends on:** `pool`, `sched`, `coroutine`, `deadlock` (the diagnostic
   channel it publishes into)
 
 ### `cancel` — ending work that is already in flight
@@ -299,7 +299,7 @@ depend on different modules.
 - **Files:** `cancel/core.rs` in `io-core`, `reactor/cancel.rs` in
   `io-reactor`
 - **Public:** `cancel`, `CancelLevel`, `Answer`. `CancelHandle` is
-  `unit`'s type; this module installs one and defines none
+  `coroutine`'s type; this module installs one and defines none
 - **Crosses its boundary:** the promise a cross-thread request carries,
   resolved by the worker that applies it; the cancelled byte, which for a
   declared actor any thread may write; the cancel handle itself, the first
@@ -309,8 +309,8 @@ depend on different modules.
   Operation half — what the kernel still owns, and the phases from
   emptying the waiter cell to the owed count reaching zero
 - **Does not know:** core half — which backend owns the operation.
-  Operation half — why the unit is being cancelled
-- **Depends on:** core half — `unit`, `sched`, `switch`, `sync`, `pool`.
+  Operation half — why the coroutine is being cancelled
+- **Depends on:** core half — `coroutine`, `sched`, `switch`, `sync`, `pool`.
   Operation half — `reactor`, `pool`
 
 ### `io-api` — the public surface and the C ABI
@@ -323,7 +323,7 @@ depend on different modules.
   liveness root and holds the write ends of foreign holders; the receive
   contract, an output slot and three outcomes rather than two; the stack
   size hint; the diagnostic channel, polled from here; the notification
-  that a unit was ended by a stack overflow
+  that a coroutine was ended by a stack overflow
 - **Knows:** what may cross the ABI and what may not; that no pool handle
   crosses it, which is what bounds the generation's staleness window; the
   registered handle table, which it implements — this is the one structure
@@ -336,7 +336,7 @@ depend on different modules.
 Three of its obligations are named in the corpus and designed nowhere: the
 register and unregister calls of the handle table, how a foreign holder
 dropping a write end becomes visible (`design/channels.md`), and the
-death-notification path for a unit ended by a stack overflow
+death-notification path for a coroutine ended by a stack overflow
 (`design/stacks.md`).
 
 ## Layering
@@ -369,13 +369,13 @@ The call graph:
 |---|---|
 | `stack` | memory manager |
 | `switch` | `stack` |
-| `unit` | `stack`, `switch`, memory manager |
-| `sched` | `unit`, `switch` |
-| `pool` | `unit`, `sched`, memory manager |
-| `sync` | `unit`, `sched`, memory manager |
-| `deadlock` | `unit`, `sched`, `pool`, `sync`, `switch`, memory manager |
-| `reactor` | `pool`, `sched`, `unit`, `deadlock` |
-| `cancel`, core half | `unit`, `sched`, `switch`, `sync`, `pool` |
+| `coroutine` | `stack`, `switch`, memory manager |
+| `sched` | `coroutine`, `switch` |
+| `pool` | `coroutine`, `sched`, memory manager |
+| `sync` | `coroutine`, `sched`, memory manager |
+| `deadlock` | `coroutine`, `sched`, `pool`, `sync`, `switch`, memory manager |
+| `reactor` | `pool`, `sched`, `coroutine`, `deadlock` |
+| `cancel`, core half | `coroutine`, `sched`, `switch`, `sync`, `pool` |
 | `cancel`, operation half | `reactor`, `pool` |
 | `io-api` | everything |
 
@@ -387,7 +387,7 @@ watchdog is armed through the worker driver and the resolution goes into
 
 `cancel` names more modules than anything else because it is the one
 module allowed to tell `reactor` that an operation must end early, and the
-only one that writes a unit's cancelled bit from outside `unit`.
+only one that writes a coroutine's cancelled bit from outside `coroutine`.
 
 ## Shared resources
 
@@ -396,17 +396,17 @@ only one that writes a unit's cancelled bit from outside `unit`.
   caller that took a buffer under contract 1 and did not submit it returns
   it through the same public release. A waiter cell inside a slot belongs
   to the worker that owns the slot, and no other thread writes it.
-- **Stacks** are owned by `stack` and lent to `unit`. A stack returns to
-  its pool when its unit completes, which is sound only because nothing
+- **Stacks** are owned by `stack` and lent to `coroutine`. A stack returns to
+  its pool when its coroutine completes, which is sound only because nothing
   the kernel may touch after submission lives on a stack: buffers and
   submission structures come from the buffer pool instead.
 - **Three structures are memory roots**, and between them they reach every
-  unit that must not be collected. The **ownership table**, owned by
+  coroutine that must not be collected. The **ownership table**, owned by
   `sched`, is a registry of lifetimes rather than a map of current owners:
-  a unit joins its creating worker's shard when it is created and leaves on
-  its terminal transition, so it reaches every registered unit and not only
+  a coroutine joins its creating worker's shard when it is created and leaves on
+  its terminal transition, so it reaches every registered coroutine and not only
   one whose wait is undecided. The **intake queues**, also `sched`'s, reach
-  a unit whose wait is decided and whose cross-thread retire is still
+  a coroutine whose wait is decided and whose cross-thread retire is still
   pending. The **timer wheel** is `reactor`'s. No pool is a root.
 - **The actor's header** lives in the arena the actor owns and is not any
   module's to allocate. `sched` writes its readiness word and its queue
@@ -427,7 +427,7 @@ measured; `dev/BENCHMARKS.md` is created with the first figure.
 | Path | Modules | What would be measured |
 |---|---|---|
 | the context switch | `switch` | cycles per switch, narrow and full |
-| park and wake | `unit`, `sched` | a round trip on one thread, and across two |
+| park and wake | `coroutine`, `sched` | a round trip on one thread, and across two |
 | completion dispatch | `reactor` | per completion, and per batch drained |
 | a channel send and receive | `sync` | the fast path with no waiter, and with one |
 | enqueue into the ready set and ring a sleeper | `sched` | how it degrades as core count rises |

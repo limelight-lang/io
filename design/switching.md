@@ -3,9 +3,9 @@
 ## What a switch is
 
 A context switch moves execution between a worker's stack and a stackful
-unit's stack. It preserves whatever holds a live value for the side being
+coroutine's stack. It preserves whatever holds a live value for the side being
 left, points the stack pointer at the other stack, and restores the same
-from there. Stackless units never switch: `poll` returns to its caller,
+from there. Stackless coroutines never switch: `poll` returns to its caller,
 so the ordinary call sequence already saved what had to be saved
 (`design/execution.md`).
 
@@ -38,7 +38,7 @@ operating system, the compiler's stack probes and structured exception
 handling: `StackBase`, `StackLimit`, `DeallocationStack` and
 `GuaranteedStackBytes`. All four are swapped with the stack. Swapping
 three of them leaves a host that called `SetThreadStackGuarantee` with
-wrong overflow behaviour on every unit stack.
+wrong overflow behaviour on every coroutine stack.
 
 Their offsets are not published, so they are hard-coded per architecture,
 as `corosensei` does in its Windows stack code. Hard-coding an
@@ -48,7 +48,7 @@ and a mismatch refuses to run rather than corrupting a TEB.
 
 ### Shadow stacks are ours to write
 
-Where hardware shadow stacks are enforced, a unit needs one of its own
+Where hardware shadow stacks are enforced, a coroutine needs one of its own
 and the switch must move it. `corosensei` does not do this: its x86-64
 code contains no CET sequence and its documentation claims none. The
 claim that the library covers the whole full switch is therefore false on
@@ -59,7 +59,7 @@ What the switch needs, per platform:
 
 - **x86-64 CET.** Swap the shadow stack pointer with `RSTORSSP` and
   `SAVEPREVSSP`. The hardware verifies a restore token at the top of the
-  target shadow stack, so no ordinary move substitutes. A unit whose
+  target shadow stack, so no ordinary move substitutes. A coroutine whose
   shadow stack is not switched dies at its first `ret` with a
   control-protection fault.
 - **AArch64.** Android's shadow call stack lives in `x18` and is switched
@@ -70,7 +70,7 @@ Allocation is the harder half and it does not belong to the switch. On
 Linux a shadow stack comes only from `map_shadow_stack`, which places the
 restore token at creation. Windows exposes no documented way to allocate
 one for a context that is not a fiber. A pooled shadow stack cannot be
-handed to a second unit until its token is reset, and with `WRSS`
+handed to a second coroutine until its token is reset, and with `WRSS`
 normally disabled that means remapping rather than writing.
 `design/stacks.md` owns this, and it owns a question rather than a
 sizing table.
@@ -84,9 +84,9 @@ Let Limelight function A keep a value in `x19` and call B. B does not use
 `x19`, so B leaves it alone, which satisfies B's ABI obligation without
 spilling anything. B suspends. B's liveness at that site does not mention
 `x19`, because the value is A's. A switch that saved only B's live
-registers would leave `x19` unsaved; another unit runs on the worker and
+registers would leave `x19` unsaved; another coroutine runs on the worker and
 overwrites it; A resumes and computes with a value belonging to a
-different unit. Nothing crashes and nothing is diagnosable.
+different coroutine. Nothing crashes and nothing is diagnosable.
 
 The sound per-site set is "the registers live in B, plus every
 callee-saved register B did not spill" — and a function that spills
@@ -130,7 +130,7 @@ the full save, and the narrow path is not available to it.
 ### Half the switch is never narrow
 
 The worker's side of every switch is rustc-compiled and always preserves
-the full set. The narrowing applies to the unit's half alone, so it can
+the full set. The narrowing applies to the coroutine's half alone, so it can
 remove at most half of the switch's register traffic. Any expectation set
 against a stackless resume has to start from that ceiling.
 
@@ -143,9 +143,9 @@ section describes.
 
 ## Selecting the path: the foreign-frame counter
 
-Selection is per unit and dynamic, because the property is a state of the
-stack rather than a property of the unit. A unit whose whole chain is
-ours narrows; the same unit stops narrowing once it calls into a foreign
+Selection is per coroutine and dynamic, because the property is a state of the
+stack rather than a property of the coroutine. A coroutine whose whole chain is
+ours narrows; the same coroutine stops narrowing once it calls into a foreign
 library and suspends in a callback.
 
 **The marker is a depth counter, not a bit.** The stub around a foreign
@@ -160,16 +160,16 @@ Its readers are three, and all of them are safety-critical:
 | Reader | What a wrong value costs |
 |---|---|
 | the switch | narrows with foreign frames live: corrupted foreign registers |
-| re-mounting an actor (`design/execution.md`) | moves a unit holding `errno` and other thread-local state to another thread |
-| cancellation (`design/cancellation.md`) | reports a unit below a live foreign frame as cancellable when it is not |
+| re-mounting an actor (`design/execution.md`) | moves a coroutine holding `errno` and other thread-local state to another thread |
+| cancellation (`design/cancellation.md`) | reports a coroutine below a live foreign frame as cancellable when it is not |
 
-Because the last two readers are about safety rather than speed, a unit
+Because the last two readers are about safety rather than speed, a coroutine
 that opts out of maintaining the counter does not opt out of its value:
 its counter reads as permanently non-zero, so it never narrows and never
 moves, every cancel against it is answered *pinned* even where no foreign
 frame is live and the bit would in fact take effect at the next park, and
 the detector never chooses it as a victim (`design/deadlock.md`). That last
-one is the cost worth naming: a cycle with an opted-out unit in it is
+one is the cost worth naming: a cycle with an opted-out coroutine in it is
 reported and never resolved, so a soft-resolvable deadlock becomes a hang
 with a report. Opting out buys back two instructions per foreign call, and
 an actor that declares the mid-message move may not also opt out
@@ -178,7 +178,7 @@ the calls are nearly all foreign and nothing depends on resolution.
 
 ## The saved context, the restore, and the first resume
 
-**Where the context lives.** At the top of the unit's own stack, not in the
+**Where the context lives.** At the top of the coroutine's own stack, not in the
 coroutine object. Its size is fixed per platform, because the narrow path
 narrows by having nothing to save rather than by saving a variable
 subset — which is a second reason to prefer the convention over the mask,
@@ -190,9 +190,9 @@ consulting one.
 constant. It does not have to learn what the save chose, because both
 sides of one switch are the same code path.
 
-**The first resume.** A unit that has never run has no saved context to
+**The first resume.** A coroutine that has never run has no saved context to
 restore, so its stack is laid out at creation: a synthetic frame whose
-return address is the unit's entry trampoline, a shadow-stack restore
+return address is the coroutine's entry trampoline, a shadow-stack restore
 token where hardware shadow stacks are enabled, and an unwind root that
 terminates the backtrace rather than pointing into a caller that does not
 exist.
@@ -200,9 +200,9 @@ exist.
 ## Unwinding, debuggers and profilers
 
 A switch that leaves no unwind metadata cuts every backtrace at the
-suspension point, and a profiler sampling a unit's stack sees a root that
+suspension point, and a profiler sampling a coroutine's stack sees a root that
 does not exist. The switch emits the platform's standard unwinding
-metadata, linking a unit's stack back to the frame that resumed it.
+metadata, linking a coroutine's stack back to the frame that resumed it.
 `corosensei` does this and states that the resulting backtraces work with
 debuggers and profilers.
 
@@ -233,7 +233,7 @@ medians (`dev/WORKFLOW.md`):
 
 - the full switch on our stack allocator rather than the library's
   default;
-- the same switch with the unit half preserving nothing, which is the
+- the same switch with the coroutine half preserving nothing, which is the
   ceiling of the possible gain and is bounded by the worker half above;
 - the spill count the `preserve_none` convention adds to real Limelight
   code at and around suspension sites, since the gain is a transfer and
@@ -264,9 +264,9 @@ these.
   different context faults. Whether `corosensei` handles arm64e, and what
   the switch owes there, is not established.
 - **Windows shadow-stack allocation for a non-fiber context.** Stated
-  above: no documented API. If none exists, either units on Windows run
+  above: no documented API. If none exists, either coroutines on Windows run
   as OS fibers where CET is enforced, or CET hosts get the full switch
-  with a per-thread shadow stack and no unit-local one — both change the
+  with a per-thread shadow stack and no coroutine-local one — both change the
   design, and neither is chosen.
 - **ARMv9 guarded control stacks.** A third mechanism after CET and
   Android's shadow call stack, with its own instructions and its own
