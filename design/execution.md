@@ -136,7 +136,9 @@ thread: a unit is touched only by its own thread, so the steps are plain
 stores and the wake that could once arrive mid-suspension cannot.
 
 1. **Write the record.** A fresh `epoch`, the entries, the mode, and
-   `remaining` for an AND wait.
+   `remaining` for an AND wait. This is the only place the epoch is
+   written: no path that ends a wait touches it (`dev/DECISIONS.md`,
+   2026-08-13).
 2. **Arm each entry.** Submit the operation, send the message, arm the
    timer — each carrying the unit, its entry index, and the epoch from
    step 1. Arming after the record is written is what guarantees a
@@ -181,6 +183,21 @@ them. There were four states and a compare-and-swap on each while a wake
 could arrive from another thread; that case is gone, and `Parking` went
 with it.
 
+**`Woken` means the wait is decided**, and that equivalence is load-bearing
+elsewhere: whoever moves `Parked → Woken` has already claimed the winner of
+an OR wait or taken `remaining` to zero, so a later signal for the same wait
+finds nothing to do. The delivery rule of `dev/DECISIONS.md`, 2026-08-13,
+drops a signal on this ground, and step 12 of `design/deadlock.md` requires
+the state to still be `Parked` for the same reason.
+
+**An actor that declares mid-message movement carries a wider word**, and
+only such an actor does (`dev/DECISIONS.md`, 2026-08-13). It holds the state
+together with the owning worker — `Running(W)`, `Parked(W)`, `WokenLocal(W)`,
+`WokenShared`, `Terminal` — its transitions are atomic stores rather than
+plain ones, and the cancelled bit moves to a byte beside it. Everything below
+reads as written for every other unit; for a declared one, "the unit's own
+thread" means the thread the word names.
+
 | From | To | By |
 |---|---|---|
 | `Running` | `Parked` | the worker, after the suspension has finished |
@@ -192,10 +209,19 @@ with it.
 
 ## Waking
 
-`wake(unit, entry, epoch, result)` runs on the unit's own thread — the
-reactor drains its worker's completions there, a mailbox is read by its
-actor's thread, and a signal from elsewhere reaches the reactor rather
-than the unit. It does five things in order.
+`wake(unit, entry, epoch, result)` runs on the thread that owns the unit —
+for every unit but one kind that is the thread it has always run on, and for
+an actor that declared mid-message movement it is the thread its state word
+names. The reactor drains its worker's completions there, a mailbox is read by
+its actor's thread, and a signal from elsewhere reaches the reactor rather
+than the unit. It does five things in order, behind one dispatch.
+
+0. **Dispatch on the state word**, once, before anything else reads the
+   record. The word names this thread, another worker, `WokenShared` or
+   `Terminal`, and only the first case continues into step 1; the others
+   forward the payload to the named worker's intake queue, or drop it
+   (`dev/DECISIONS.md`, 2026-08-13). Dispatch stands ahead of the epoch check
+   so that no foreign thread ever reads the epoch.
 
 1. **Validate the epoch.** Compare the record's epoch with the argument.
    A mismatch means this entry was retired and the unit has since parked
@@ -207,16 +233,29 @@ than the unit. It does five things in order.
    counted reference to it, so it is alive for as long as the wake can
    arrive.
 2. **Store the result** into that entry.
-3. **Decide whether the wait is over.** Under **OR**, claim the winner
-   field; a caller that finds it claimed returns. Under **AND**,
+3. **Decide whether the wait is over.** A caller that finds the wait
+   already decided returns here, before the counter is touched: a retired
+   entry firing after `remaining` reached zero would otherwise drive it
+   negative, and no reader is prepared for that. Under **OR**, claim the
+   winner field; a caller that finds it claimed returns. Under **AND**,
    decrement `remaining`; a caller that does not take it to zero returns.
 4. **Retire the other entries** through their cancel handles. Retirement
-   is asynchronous, so a retired entry may still fire; the epoch check in
-   step 1 is what makes that harmless.
-5. **Move the state word** from `Parked` to `Woken` and enqueue.
+   is asynchronous, so a retired entry may still fire. Once the unit has
+   parked again, step 1 rejects it on the epoch; until then step 3 does,
+   because the wait is already decided.
+5. **Move the state word and enqueue**, and this is the one place a declared
+   actor changes hands. Ordinarily: store `Woken`, or `WokenLocal(W)` for a
+   declared actor, and enqueue into this worker's own list. On the move path,
+   which needs the declaration, a foreign-frame counter of zero and this
+   message's single move unspent: store-release `WokenShared`, then push to the
+   ready set, then ring a sleeper. The word goes before the queue, and after
+   that store this worker touches the unit no more — including its own later
+   intake entries about it, which step 0 catches. A cancel always takes the
+   ordinary path, because a unit that is unwinding has no reason to move.
 
 Steps 1 through 4 are what make wakes safe to repeat. Step 5 is what
-makes them arrive exactly once.
+makes them arrive exactly once, and step 0 is what makes them safe to deliver
+to a unit that has changed threads.
 
 ## The wait record
 
@@ -287,6 +326,12 @@ substrate does not know what that context is: the consumer supplies a
 mount hook and an unmount hook, and Limelight's hook installs the actor
 context and puts the current arena into thread-local storage. A consumer
 without actors installs whatever it has, or nothing.
+
+**Mounting a unit that changed threads takes the claim first.** Where the
+state word reads `WokenShared`, the mounting worker compare-exchanges it to
+`Running(W)` with acquire semantics, paired with the release store that put it
+there, and installs the arena only after winning
+(`dev/DECISIONS.md`, 2026-08-13). Whoever loses does not mount.
 
 The hooks fire when a unit is mounted on a thread and when it leaves,
 never per `poll` of a stackless unit. A stackless unit installs no actor
@@ -361,13 +406,15 @@ below our frame holds thread-local state we neither see nor move:
 broken when that state is read on the wrong thread after a move; it was
 simply left behind.
 
-**When an actor may be re-mounted** is fixed in shape and open in detail
-(`dev/DECISIONS.md`, 2026-08-12): only where it has stopped — reading its
-mailbox, and waiting — and never while its foreign-frame counter is
-non-zero. Which waits qualify, and what a consumer over the C ABI
-declares about its own frames, is being researched. Until it closes, the
-implementation re-mounts an actor only at a message boundary, which is
-correct under every candidate answer.
+**An actor may be re-mounted at any suspension point** (`dev/DECISIONS.md`,
+2026-08-13). What differs between points is the price: between messages the
+move carries nothing, because there is no unit and no stack, while inside a
+message it carries the live stack and the saved registers, and it turns "the
+unit's own thread" into a claim the state word names. That price is paid only
+by an actor that declares mid-message movement, and such an actor moves at
+most once per message. A non-zero foreign-frame counter vetoes a move at any
+point, and a declaration cannot be combined with opting out of the counter:
+the pair is rejected when the actor is created.
 
 ## Migration and the single `unsafe impl Send`
 

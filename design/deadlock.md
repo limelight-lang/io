@@ -194,7 +194,7 @@ An outstanding entry is live when:
 | semaphore, guard-released | the free permits plus the permits held by L-marked holders cover what the waiter asked for. **Dead, and no edge**, for a permit held by a terminated coroutine: teardown drops its guards and returns the permit, so a terminated holder still counted is a leak. One edge per dead holder of a needed permit |
 | semaphore, postable | the free permits cover the request, or the semaphore is served, or its handle is L-marked. Holders are not read: whoever reaches the handle can post |
 | join | the target is L-marked or terminal, a terminal target's completion wake being in flight |
-| actor call | the callee's current unit is L-marked, or the callee has a queued unit or a non-empty mailbox |
+| actor call | the callee's current unit is L-marked, or the callee's readiness word reads ready or running, or its mailbox is non-empty. The readiness word is load-bearing rather than a convenience: between the worker taking a message out of the mailbox and creating the unit for it, the other two clauses are both false, and without this one a healthy synchronous call is reported deadlocked (`dev/DECISIONS.md`, 2026-08-13) |
 | channel receive | the buffer is non-empty, or the channel is served, or the channel is closed, or the write end is L-marked |
 | channel send | the buffer has space, or the channel is served by a pending take, or the channel is closed, or the read end is L-marked |
 | future await | it is resolved or broken, or the future is served, or the promise is L-marked |
@@ -483,6 +483,18 @@ deadlock, and the walk alone for a total freeze.
   set both rest on one queue per worker drained in order, so a priority
   lane for cancels — an optimization that document's own motivation invites
   — would fail a healthy waiter.
+  A total order across producers is the costly half of that contract, and a
+  deposit and a resolution do come from different producers. The structure
+  that gives such an order is a bounded ring with one shared index, and
+  TrueAsync's server measured rings of that shape at 2.3 M ops/s against
+  56–68 M for per-producer sub-queues at eight producers
+  (`true-async-server/deps/concurrentqueue/UPSTREAM.md`: i7-11700K, pointer
+  payload, capacity 4096, that project's workload rather than ours). Three
+  answers are open: pay for the shared index; carry resolutions on a
+  separate lane whose only producer is the collector, drained after the
+  intake queue is empty; or have the owner re-read the resource before
+  applying a resolution, which costs one read per resolution and makes the
+  order irrelevant.
 - **The threshold.** A deployment parameter with no measurement.
 - **Correctness of consumer-supplied resources.** A mutex or channel built
   over the C ABI must keep its owner field truthful and its write ends in

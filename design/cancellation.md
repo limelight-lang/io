@@ -21,34 +21,33 @@ ordinary wake path decrements `remaining` and returns without waking
 until it reaches zero; and a cancel racing with a park was lost, because
 it validated an epoch the unit was in the middle of replacing.
 
-**The state word carries a cancelled bit**, and the canceller sets it with
-a compare-and-swap on the same word the parking protocol already uses
-(`design/execution.md`):
+**The state word carries a cancelled bit, written by the unit's own
+thread.** A cancel raised on another thread is posted to the owning
+worker's intake queue and applied when that worker drains it, so the bit is
+a plain store on the same word the parking protocol writes
+(`design/execution.md`). Three states, and the row for a freed unit is gone
+with the generation it used to check: whoever raises a cancel holds a
+counted reference, so the unit cannot be gone.
 
-| State found | Transition | Effect |
+| State found | What the canceller does | Effect |
 |---|---|---|
-| `Running` | set the bit | the unit's next park attempt fails and it resumes cancelled |
-| `Parking` | `Parking → Woken`, bit set | the worker's failed swap enqueues, as for any wake |
-| `Parked` | `Parked → Woken`, bit set | the canceller enqueues |
+| `Running` | set the bit | the unit's next park attempt does not sleep and it resumes cancelled |
+| `Parked` | store the error, claim the wait, retire the entries, store `Woken`, enqueue | the ordinary wake path with the cancel as its winner |
 | `Woken` | set the bit | the unit is already owed a slot; it resumes cancelled |
-| free, or generation changed | none | the unit is gone; the request reports so |
 
-The transition is one atomic operation on one word, so there is no window
-between validating the occupant and marking it, and no epoch to race
-against.
+**Claiming the wait is what makes every other waker harmless**, and the
+epoch is not touched: it is written once, when the unit parks
+(`dev/DECISIONS.md`, 2026-08-13). An entry that fires after the claim finds
+the wait decided and returns, regardless of mode, so an AND wait's counter
+is never consulted. Retirement happens once, performed by whoever claimed,
+so cancel handles are called exactly once and need not be idempotent.
 
-**Whoever wins the transition bumps the epoch and retires the entries.**
-Bumping the epoch is what makes every armed entry stale, so no other waker
-can also claim the wait: the cancel is the winner regardless of mode, and
-an AND wait's counter is never consulted. Retirement happens once,
-performed by the winner, so cancel handles are called exactly once and
-need not be idempotent.
-
-**The parking protocol checks the bit at one place**: the worker's
-`Parking → Parked` swap, which fails if the bit is set exactly as it fails
-on `Woken`. A unit that begins parking after the bit was set therefore
-does not sleep, and the check needs no new ordering because it is the
-swap that was already there.
+**The parking protocol reads the bit at one place**: step 4, where the
+worker stores `Parked`. With the bit set it stores `Woken` and enqueues
+instead, so a unit cancelled while it was suspending does not sleep. No
+ordering is needed beyond the sequence the protocol already has, because
+both the cancel and the park run on this one thread — a cancel drained
+before the park sees `Running`, and one drained after it sees `Parked`.
 
 ### What the requester learns
 
@@ -94,12 +93,15 @@ on what armed it:
   arrival. There is nothing to recall.
 - **A kernel operation** is two phases, below.
 
-**Retirement is asynchronous and a retired entry may still fire.** What
-makes that harmless is the epoch bump performed by whoever ended the wait:
-a late completion validates against the record's current epoch, finds it
-moved, and returns (`design/execution.md`). The epoch moves at the moment
-the wait ends, not at the unit's next park, which is why the bump belongs
-to the winner rather than to the next parking.
+**Retirement is asynchronous and a retired entry may still fire.** Two
+tests make that harmless and they answer different questions
+(`design/execution.md`). A signal from a wait the unit has already left
+carries a stale epoch, because the epoch is written once, when the unit
+parks again. A signal from the current wait, already decided, is rejected
+by the winner field under OR and by `remaining` under AND. Nothing bumps
+the epoch when a wait ends: that would give the record's identity three
+writers, since an OR winner, a cancel and a deadlock resolution all end
+waits.
 
 ## Cancelling a kernel operation is two phases
 
