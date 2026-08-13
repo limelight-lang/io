@@ -287,7 +287,13 @@ pooling is the reason this document exists.
 ## Open questions
 
 - **The class tables.** Sizes, their number, and the warm watermark are
-  measurements, one table per page size, and no measurement exists.
+  measurements, one table per page size, and no measurement exists. When
+  they are measured, **the class may not be fixed from a first
+  observation**: Project Loom sizes a stack chunk at its first suspension
+  and Quarkus measured a fourfold overshoot from it, because the first
+  suspension falls during warm-up when the same code is compiled by the
+  first tier and its frames are larger (`dev/DECISIONS.md`, 2026-08-13).
+  Re-classify when a stack returns to the pool, or class by the call site.
 - **Windows lazy commit.** Whether TEB-installed bounds give a
   self-allocated reservation the kernel's guard growth, and what the
   fallback costs.

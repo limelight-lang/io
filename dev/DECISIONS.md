@@ -1426,3 +1426,80 @@ Struck by this entry: `design/channels.md`'s "the intake queue itself is
 ordering contract; the same debtor in `design/deadlock.md`'s open questions
 and in `dev/INDEX.md`. Every "reactor intake queue" in the design documents
 is a worker intake queue; superseded entries here keep their wording.
+
+## 2026-08-13 — Project Loom as a precedent: what it closes and what it lends
+
+Recorded because Loom made the opposite trade on our central question and
+shipped it, so its experience is evidence rather than opinion. Nothing here
+changes a decision; two items become obligations and one becomes an open
+question.
+
+**The heap-stored stack is closed to us, and not for want of ingenuity.**
+Loom stores a suspended virtual thread's frames in a heap object and copies
+them back one frame at a time, patching a return address so that the next
+return traps into the runtime and thaws the next frame. Both halves require
+the runtime to have compiled every frame in the stack: it must know each
+self-referential pointer to rewrite when the object moves, and it must be
+free to overwrite a return address. A C ABI supplies neither. The Loom
+proposal of 2018 names that as the precondition it chose to accept —
+supporting native languages would require the stack to be contiguous and to
+stay at one address, and a language runtime is not obliged to support
+arbitrary native code. The shipped record agrees: JEP 444 named two cases
+that pin a virtual thread to its carrier, `synchronized` and native code;
+JEP 491 removed the first in JDK 24 and kept the second deliberately. Eight
+years and a dedicated JEP did not close the foreign-frame case. Treat it as
+settled rather than open.
+
+**Three findings transfer, and none is about stacks in the heap.**
+
+*Work stealing has a measured failure with a profile.* JDK-8360046, Sergey
+Kuksenko, Oracle, 2025-06-19, on a two-socket Xeon 8368 of 38 cores each:
+virtual threads diverge from platform threads at 16 cores and are 4.4x
+slower at 32 on the same work, with one instruction —
+`compareAndExchangeCtl` inside `ForkJoinPool::signalWork` — taking 17.12%
+of all cycles against 1.78% for the platform-thread case. The repair landed
+in JDK 26 and was backed out twice, JDK-8375130 and JDK-8379525, because it
+traded that contention for starvation. Their machine and their workload,
+not ours. What it obliges: our enqueue into the shared ready set and the
+ring of a sleeper is the same shape, and when it is measured it is measured
+against that number rather than against the O(N²) scan we rejected stealing
+for. The two are different mechanisms and this is a second, independent
+reason.
+
+*Enumerability and collection are in direct conflict, and the JDK shipped
+the wrong default for four major versions.* JEP 425 states that a parked
+virtual thread nobody can reach is collectable. It is not: `ThreadContainers`
+keeps every started virtual thread in a static set of strong references
+unless told otherwise. Measured by an agent of mine on this machine — WSL2,
+16 cores, OpenJDK 21.0.2, SerialGC, 200 000 parked virtual threads at depth
+one — 741.9 bytes retained per thread whether the program held references or
+dropped them, and 0.6 bytes per thread with `-Djdk.trackAllThreads=false`.
+Measured on Java, not on us. What it obliges: our detector needs coroutines
+enumerable and our scheduler's ownership table is a memory root, so whether
+that table retains a coroutine that can never run again is a question this
+corpus has not asked. **Open.**
+
+*Never fix a stack's size class from its first observation.* The Quarkus
+team instrumented the JVM under Netty with ten thousand connections and
+measured a reused stack chunk of 1149 machine words against a steady-state
+live stack of about 286 — a fourfold overshoot, because the capacity is
+fixed at the first freeze, which happens during warm-up while the same code
+is still compiled by the first-tier compiler and produces larger frames.
+Their machine and workload. What it obliges: `design/stacks.md`'s size
+classes and warm watermark must not be chosen from a first observation.
+
+**Two positions of Loom's confirm ours and add nothing.** Ron Pressler
+refused to compensate for pinning by creating carriers, on the grounds that
+pinning has no bound and new carriers pin too, preferring "a deadlock and
+observability reporting that can help the programmer actually solve the
+issue" (JDK-8334304, 2024-07-08) — which is `design/deadlock.md`'s thesis.
+And forced preemption was removed from Loom outright, `openjdk/loom` commit
+`8a4613775b74` of 2022-04-02, leaving only the VM-internal path; our
+"a coroutine always ends itself" is the same position.
+
+**One counter-example is worth keeping.** `ForkJoinPool`'s saturation
+predicate lets the pool continue with fewer threads than its target when
+compensation would exceed the maximum, and its own documentation says this
+"might not ensure progress". Silent degradation where we chose a report:
+the reactor publishes re-arm starvation rather than quietly serving fewer
+sockets.
