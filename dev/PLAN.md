@@ -247,10 +247,21 @@ design document describes machinery that has been retired.
       done: the parking diagram matches the numbered protocol in
         `design/execution.md` step for step
       tier: T2 · role: Critic
-- [ ] S5.6 Toolchain and build, as a `dev/DECISIONS.md` entry
+- [x] S5.6 Toolchain and build, as a `dev/DECISIONS.md` entry
       done: the rustc version and where it comes from (the single-LLVM
         rule in the rfc), edition, MSRV, backend features, CI targets
       tier: T1 · role: —
+      Taken out of order, while S5.4 waited on a Sage ruling: it depends on
+        the rfc and on `design/reactor.md` and `design/switching.md`, and on
+        nothing S5.4 or S5.5 decides.
+      handoff: `dev/DECISIONS.md` of 2026-08-13 carries it. The toolchain is
+        pinned in `rust-toolchain.toml` rather than bounded by an MSRV,
+        because the C++ layer must hold rustc's own LLVM; pinned today is
+        rustc 1.96.0 with LLVM 22.1.2, edition 2024, all read by running the
+        compiler. Two version checks are owed to CI, and both fail on this
+        machine unpinned: system LLVM is 22.1.8 and system Clang is 18.1.3.
+        Seven CI targets follow the platform table of `design/switching.md`;
+        which of them ever runs its tests is open.
 - [ ] S5.7 Test strategy, as a section of `dev/WORKFLOW.md`
       done: every hot path named in `dev/ARCHITECTURE.md` says what checks
         it, or says that nothing does

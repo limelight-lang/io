@@ -1289,3 +1289,64 @@ that hands one out reopens the width question for that pool alone. The
 Left open by name: whether the collector's barrier discipline covers a
 counted reference handing off between two roots mid-pass, which joins the
 `ll-model` integration item rather than being decided here.
+
+## 2026-08-13 — Toolchain: one pinned rustc, and its LLVM is the project's
+
+`rfc/runtime/implementation-language.md` makes this a build-system rule
+rather than a preference: every participant that produces bitcode must
+share one LLVM version, and since rustc pins its own, **rustc's LLVM
+dictates the project's**. The C++ layer, the JIT and Clang are built
+against it. That single sentence decides most of what follows.
+
+**The toolchain is pinned in `rust-toolchain.toml`, not bounded by a
+minimum.** A range is what a published library offers its consumers; this
+substrate is compiled into one artifact beside a C++ layer that must hold
+the same LLVM, so a consumer free to choose an older rustc is a consumer
+free to break the link step. There is therefore no MSRV distinct from the
+pinned version: they are the same number, and raising it is an edit of one
+file plus a rebuild of the C++ layer.
+
+**Pinned today: rustc 1.96.0** (`ac68faa20`, 2026-05-25), which reports
+LLVM 22.1.2. Verified by running it rather than read from a table.
+Cargo 1.96.0 ships with it. **Edition 2024**, which is what that toolchain
+emits for a new crate.
+
+**Two version checks belong in CI, and both fail on the machine this was
+written on.** `llvm-config` here reports 22.1.8 against rustc's 22.1.2 —
+same minor, different patch, and the rule as written says one version, so
+whether a patch difference is admissible has to be decided before the
+first bitcode is linked rather than discovered at link time. The system
+Clang here is 18.1.3, four major versions below, and cannot participate at
+all. Neither figure is a property of the project; both are what a
+developer machine looks like without the pin applied, which is the
+argument for checking it in CI instead of in a README.
+
+**Backends are cargo features, one per kernel interface**: `io_uring`,
+`iocp`, `kqueue`, `epoll` (`design/reactor.md`). A target enables the
+features its kernel offers, and a consumer that runs computation without
+I/O compiles none of them.
+
+**CI targets follow the platform table of `design/switching.md`**, because
+that table is what the context switch is written against and an untested
+row there is a row nobody has run:
+
+| Target | Switch row | Backend |
+|---|---|---|
+| `x86_64-unknown-linux-gnu` | x86-64 SysV | `io_uring`, `epoll` |
+| `aarch64-unknown-linux-gnu` | AArch64 ELF | `io_uring`, `epoll` |
+| `x86_64-pc-windows-msvc` | x86-64 Windows | `iocp` |
+| `aarch64-pc-windows-msvc` | AArch64 Windows | `iocp` |
+| `aarch64-apple-darwin` | AArch64 Darwin | `kqueue` |
+| `armv7-unknown-linux-gnueabihf` | ARM 32-bit | `epoll` |
+| `riscv64gc-unknown-linux-gnu` | RISC-V 64 | `epoll` |
+
+The first three gate a merge and run their tests; the rest are built and
+cross-checked without running, until there is hardware or an emulator
+worth the minutes. Which of them ever gets a running test is a question
+for the stage that writes code, and it is open.
+
+Cost: a pinned toolchain means a Rust release the project cannot take
+until the C++ layer follows it, so the upgrade is one change to three
+things at once. That is the price of linking bitcode from two compilers,
+and the alternative — letting rustc float — buys nothing, because the
+LLVM it drags along is not ours to choose.
